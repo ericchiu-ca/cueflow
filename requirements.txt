@@ -1,0 +1,2 @@
+faster-whisper>=1.2.0  # optional: used only when no subtitles are available
+yt-dlp>=2024.1

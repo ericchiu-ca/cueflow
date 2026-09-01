@@ -1,0 +1,15 @@
+CueFlow Han Sans SC SemiBold
+================================
+
+Font file: CueFlowHanSansSC-SemiBold.otf
+Upstream: SourceHanSansCN-VF.otf, Source Han Sans 2.005R
+Upstream project: https://github.com/adobe-fonts/source-han-sans
+
+Modifications:
+- Pinned the variable wght axis to 600.
+- Renamed the internal family, full, and PostScript names to remove Adobe's
+  Reserved Font Name "Source".
+- No glyph outlines or character mappings were otherwise changed.
+
+This modified font remains licensed under the SIL Open Font License 1.1.
+See LICENSE-SourceHanSans.txt in this directory.

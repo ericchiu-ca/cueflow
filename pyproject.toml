@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cueflow-subtitles"
+version = "0.4.0"
+description = "Local-first subtitle transcription, translation, review, ASS, and video workflow for Apple Silicon macOS"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE", "assets/fonts/LICENSE-*.txt"]
+keywords = ["subtitles", "whisper", "whisperx", "mlx", "srt", "ass", "ffmpeg"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: MacOS X",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Multimedia :: Video",
+]
+dependencies = ["yt-dlp>=2024.1"]
+
+[project.urls]
+Homepage = "https://github.com/ericchiu-ca/cueflow"
+Documentation = "https://github.com/ericchiu-ca/cueflow#readme"
+Issues = "https://github.com/ericchiu-ca/cueflow/issues"
+
+[project.optional-dependencies]
+asr = ["faster-whisper>=1.2.0"]
+
+[project.scripts]
+cueflow = "subflow.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["subflow*"]
+
+[tool.setuptools.package-data]
+subflow = ["static/*.html", "schemas/*.json"]
+
+[tool.setuptools.data-files]
+"share/cueflow/fonts" = [
+  "assets/fonts/Inter-Medium.ttf",
+  "assets/fonts/Mulish-SemiBold.ttf",
+  "assets/fonts/CueFlowHanSansSC-SemiBold.otf",
+  "assets/fonts/LICENSE-Inter.txt",
+  "assets/fonts/LICENSE-Mulish.txt",
+  "assets/fonts/LICENSE-SourceHanSans.txt",
+  "assets/fonts/NOTICE-CueFlowHanSansSC.txt",
+]
