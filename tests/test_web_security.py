@@ -428,6 +428,83 @@ class WebRobustnessTests(unittest.TestCase):
             finally:
                 manager.executor.shutdown(wait=True, cancel_futures=True)
 
+    def test_submitted_jobs_share_one_lifecycle(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            manager = make_manager(Path(temp_value) / "output")
+            try:
+                seen = {}
+
+                def good(report, project):
+                    report("working", 50, "halfway")
+                    seen["mid"] = manager.snapshot("ok")
+                    seen["project"] = project
+                    return {"message": "done", "output_path": "x"}
+
+                def bad(report, project):
+                    raise ValueError("boom")
+
+                for identifier, work in (("ok", good), ("bad", bad)):
+                    manager._create_job(identifier, "burn", Path(temp_value) / identifier)
+                    manager._submit(
+                        identifier,
+                        work,
+                        queued_message="queued",
+                        failure_message="failed hard",
+                        running={"stage": "prep", "percent": 5},
+                    )
+                manager.executor.shutdown(wait=True)
+                self.assertEqual(seen["mid"]["status"], "running")
+                self.assertEqual((seen["mid"]["stage"], seen["mid"]["percent"]), ("working", 50))
+                self.assertEqual(seen["project"], Path(temp_value) / "ok")
+                ok = manager.snapshot("ok")
+                self.assertEqual((ok["status"], ok["percent"], ok["message"], ok["output_path"]), ("complete", 100, "done", "x"))
+                bad_job = manager.snapshot("bad")
+                self.assertEqual((bad_job["status"], bad_job["message"], bad_job["error"]), ("failed", "failed hard", "boom"))
+            finally:
+                manager.executor.shutdown(wait=True, cancel_futures=True)
+
+    def test_failed_translation_can_be_retried_in_place(self):
+        from subflow.translation import TranslationError
+
+        source_srt = "1\n00:00:01,000 --> 00:00:02,000\nHello\n"
+        with tempfile.TemporaryDirectory() as temp_value:
+            manager = make_manager(Path(temp_value) / "output")
+            try:
+                calls = []
+
+                def fake_run(project, segments, **kwargs):
+                    calls.append((project, [s.text for s in segments]))
+                    if len(calls) == 1:
+                        (project / "source.srt").write_text(source_srt, encoding="utf-8")
+                        raise TranslationError("batch 1 failed")
+                    zh = project / "output" / "zh.srt"
+                    zh.parent.mkdir(exist_ok=True)
+                    zh.write_text("x", encoding="utf-8")
+                    ids = project / "translation_zh.txt"
+                    ids.write_text("x", encoding="utf-8")
+                    return type("A", (), {"warnings": (), "segment_count": 1, "provider": "codex",
+                                          "model": kwargs["model"], "zh_srt_path": zh,
+                                          "translation_text_path": ids})()
+
+                with patch("subflow.web.run_translation_project", side_effect=fake_run):
+                    job = manager.create_translation_job("a.srt", source_srt, "en", "auto")
+                    manager.executor.submit(lambda: None).result()
+                    self.assertEqual(manager.snapshot(job["id"])["status"], "failed")
+                    with self.assertRaisesRegex(ValueError, "not found"):
+                        manager.retry_translation("missing")
+                    retried = manager.retry_translation(job["id"])
+                    self.assertEqual(retried["id"], job["id"])
+                    manager.executor.submit(lambda: None).result()
+                final = manager.snapshot(job["id"])
+                self.assertEqual(final["status"], "complete")
+                self.assertIsNone(final["error"])
+                self.assertEqual(calls[0][0], calls[1][0])  # same project, so checkpoints apply
+                self.assertEqual(calls[1][1], ["Hello"])
+                with self.assertRaisesRegex(ValueError, "Only a failed"):
+                    manager.retry_translation(job["id"])
+            finally:
+                manager.executor.shutdown(wait=True, cancel_futures=True)
+
     def test_discard_project_only_removes_managed_project_directories(self):
         with tempfile.TemporaryDirectory() as temp_value:
             root = Path(temp_value) / "output"

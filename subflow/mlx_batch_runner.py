@@ -73,13 +73,22 @@ def main() -> int:
         with contextlib.redirect_stdout(sys.stderr):
             import mlx_whisper
 
+        checkpoint_value = request.get("checkpoint_path")
+        checkpoint = Path(str(checkpoint_value)) if checkpoint_value else None
         output: list[dict[str, Any]] = []
         for item in items:
             item_id = str(item.get("id", ""))
             try:
-                output.append(
-                    {"id": item_id, "result": _transcribe(mlx_whisper, model_path, item)}
-                )
+                entry = {"id": item_id, "result": _transcribe(mlx_whisper, model_path, item)}
+                output.append(entry)
+                if checkpoint is not None and item.get("key"):
+                    # One line per finished clip, flushed immediately, so a crash
+                    # or timeout later in the batch keeps everything done so far.
+                    with checkpoint.open("a", encoding="utf-8") as handle:
+                        handle.write(
+                            json.dumps({"key": item["key"], **entry}, ensure_ascii=False, allow_nan=False)
+                            + "\n"
+                        )
             except Exception as exc:
                 output.append(
                     {"id": item_id, "error_type": type(exc).__name__, "error": str(exc)}

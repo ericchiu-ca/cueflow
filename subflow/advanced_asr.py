@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
 import shutil
+import subprocess
 import tempfile
 import wave
 from dataclasses import dataclass
@@ -104,15 +106,40 @@ def _worker_error_detail(stderr: str, stdout: str) -> str:
     return detail[-WORKER_ERROR_DETAIL_CHARS:]
 
 
+# Worker timeouts scale with the audio they process instead of a flat 8 h:
+# a fixed allowance for model loading plus a generous multiple of real time.
+WORKER_STARTUP_SECONDS = 600
+VAD_SECONDS_PER_AUDIO_SECOND = 2
+TURBO_SECONDS_PER_AUDIO_SECOND = 3
+LARGE_SECONDS_PER_AUDIO_SECOND = 8
+BATCH_WORKER_ATTEMPTS = 2
+
+
+def _audio_seconds(path: Path) -> float:
+    try:
+        with wave.open(str(path), "rb") as audio:
+            return audio.getnframes() / float(audio.getframerate() or 1)
+    except (OSError, wave.Error, EOFError):
+        return 0.0
+
+
 def _run_json_worker(
-    python: Path, script: Path, request: dict, environment: dict[str, str]
+    python: Path,
+    script: Path,
+    request: dict,
+    environment: dict[str, str],
+    *,
+    timeout: float,
 ) -> dict:
-    completed = run_captured(
-        [str(python), str(script)],
-        input=json.dumps(request, ensure_ascii=False),
-        timeout=28800,
-        env=environment,
-    )
+    try:
+        completed = run_captured(
+            [str(python), str(script)],
+            input=json.dumps(request, ensure_ascii=False),
+            timeout=timeout,
+            env=environment,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{script.name} timed out after {timeout:.0f} s") from exc
     if completed.returncode != 0:
         raise RuntimeError(
             f"{script.name} exited with {completed.returncode}: "
@@ -157,21 +184,83 @@ def _write_clips(source: Path, windows: list[dict], directory: Path) -> list[Pat
     return clips
 
 
+def _clip_key(model: Path, item: dict) -> str:
+    digest = hashlib.sha256()
+    digest.update(f"{model.name}\0{item.get('language', 'auto')}\0".encode("utf-8"))
+    with open(item["audio_path"], "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _read_checkpoint(path: Path | None) -> dict[str, dict]:
+    done: dict[str, dict] = {}
+    if path is None or not path.is_file():
+        return done
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # a line cut short by a crash
+        if isinstance(entry, dict) and entry.get("key") and isinstance(entry.get("result"), dict):
+            done[str(entry["key"])] = entry
+    return done
+
+
 def _batch_results(
-    python: Path, model: Path, items: list[dict], environment: dict[str, str]
+    python: Path,
+    model: Path,
+    items: list[dict],
+    environment: dict[str, str],
+    *,
+    checkpoint: Path | None = None,
+    seconds_per_audio_second: float = TURBO_SECONDS_PER_AUDIO_SECOND,
 ) -> dict[str, dict]:
-    response = _run_json_worker(
-        python,
-        Path(__file__).with_name("mlx_batch_runner.py"),
-        {"protocol": MLX_PROTOCOL, "model_path": str(model), "items": items},
-        environment,
-    )
-    items = response.get("items")
-    return {
-        str(item.get("id", "")): item
-        for item in (items if isinstance(items, list) else [])
-        if isinstance(item, dict)
-    }
+    """Run a batch, resuming from `checkpoint` after a crash or timeout.
+
+    Finished clips are keyed by audio content, model and language, so only
+    identical work is ever reused.
+    """
+    keyed = [dict(item, key=_clip_key(model, item)) for item in items]
+    results: dict[str, dict] = {}
+    last_error: RuntimeError | None = None
+    for _attempt in range(BATCH_WORKER_ATTEMPTS):
+        done = _read_checkpoint(checkpoint)
+        pending = [item for item in keyed if item["key"] not in done]
+        if not pending:
+            last_error = None
+            break
+        request = {"protocol": MLX_PROTOCOL, "model_path": str(model), "items": pending}
+        if checkpoint is not None:
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            request["checkpoint_path"] = str(checkpoint)
+        audio = sum(_audio_seconds(Path(item["audio_path"])) for item in pending)
+        try:
+            response = _run_json_worker(
+                python,
+                Path(__file__).with_name("mlx_batch_runner.py"),
+                request,
+                environment,
+                timeout=WORKER_STARTUP_SECONDS + seconds_per_audio_second * audio,
+            )
+        except RuntimeError as error:
+            last_error = error
+            if checkpoint is None:
+                break
+            continue
+        entries = response.get("items")
+        for entry in entries if isinstance(entries, list) else []:
+            if isinstance(entry, dict):
+                results[str(entry.get("id", ""))] = entry
+        last_error = None
+        break
+    if last_error is not None:
+        raise last_error
+    done = _read_checkpoint(checkpoint)
+    for item in keyed:
+        if item["id"] not in results and item["key"] in done:
+            results[item["id"]] = dict(done[item["key"]], id=item["id"])
+    return results
 
 
 def _finite(value: object) -> float | None:
@@ -705,6 +794,7 @@ def transcribe_vad_cascade(
     environment = _offline_env(environment_factory())
     requested_language = {"en": "en", "fr": "fr", "mixed": "auto"}[language]
     report(34, "正在检测语音活动窗口（VAD）")
+    vad_timeout = WORKER_STARTUP_SECONDS + VAD_SECONDS_PER_AUDIO_SECOND * _audio_seconds(wav_path)
     vad = _run_json_worker(
         whisperx_python,
         Path(__file__).with_name("vad_runner.py"),
@@ -717,6 +807,7 @@ def transcribe_vad_cascade(
             "padding": 0.2,
         },
         environment,
+        timeout=vad_timeout,
     )
     windows = [
         window for window in vad.get("windows", []) if float(window.get("duration", 0)) > 0
@@ -733,7 +824,15 @@ def transcribe_vad_cascade(
             for window, clip in zip(windows, clips)
         ]
         report(40, f"正在用 Turbo 转写 {len(windows)} 个语音窗")
-        turbo_output = _batch_results(worker_python, turbo_model, turbo_items, environment)
+        checkpoint_dir = project_dir / ".subflow-asr-checkpoint"
+        turbo_output = _batch_results(
+            worker_python,
+            turbo_model,
+            turbo_items,
+            environment,
+            checkpoint=checkpoint_dir / "turbo.jsonl",
+            seconds_per_audio_second=TURBO_SECONDS_PER_AUDIO_SECOND,
+        )
         turbo_candidates = [
             _candidate(
                 turbo_output.get(str(window["index"])),
@@ -769,7 +868,14 @@ def transcribe_vad_cascade(
         if large_items:
             report(58, f"正在用 large-v3 复核 {len(retry_languages)} 个低置信度语音窗")
         large_output = (
-            _batch_results(worker_python, large_model, large_items, environment)
+            _batch_results(
+                worker_python,
+                large_model,
+                large_items,
+                environment,
+                checkpoint=checkpoint_dir / "large-v3.jsonl",
+                seconds_per_audio_second=LARGE_SECONDS_PER_AUDIO_SECOND,
+            )
             if large_items
             else {}
         )
@@ -845,6 +951,8 @@ def transcribe_vad_cascade(
                 if min(float(window["end"]), segment.end)
                 > max(float(window["start"]), segment.start)
             ]
+        # Checkpoints only exist to survive a failed run of this project.
+        shutil.rmtree(checkpoint_dir, ignore_errors=True)
         return AdvancedAsrResult(
             segments=segments,
             quality_issues=quality_issues,

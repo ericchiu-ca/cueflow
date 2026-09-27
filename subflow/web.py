@@ -300,11 +300,20 @@ class JobManager:
         )
         return job, media
 
-    def start_transcription(self, identifier: str, media: Path, language: str, alignment: str) -> None:
-        self._update(identifier, status="queued", stage="queued", percent=1, message="Queued for local transcription")
+    def _submit(
+        self,
+        identifier: str,
+        work,
+        *,
+        queued_message: str,
+        failure_message: str,
+        running: dict | None = None,
+    ) -> None:
+        """Queue `work(report, project) -> completion fields` with shared bookkeeping."""
+        self._update(identifier, status="queued", stage="queued", percent=1, message=queued_message)
 
         def run() -> None:
-            self._update(identifier, status="running")
+            self._update(identifier, status="running", **(running or {}))
 
             def report(stage: str, percent: int, message: str) -> None:
                 self._update(identifier, stage=stage, percent=percent, message=message)
@@ -312,53 +321,60 @@ class JobManager:
             try:
                 snapshot = self.snapshot(identifier)
                 if snapshot is None:
-                    raise RuntimeError("Transcription job disappeared from the local queue.")
-                result = transcribe_media(
-                    media,
-                    Path(snapshot["project"]),
-                    language=language,
-                    alignment_mode=alignment,
-                    model_path=self.model_path,
-                    helper_path=self.helper_path,
-                    whisperx_python=self.whisperx_python,
-                    progress=report,
-                )
-                self._update(
-                    identifier,
-                    status="complete",
-                    stage="complete",
-                    percent=100,
-                    message=(
-                        "SRT generated"
-                        f" · confidence H{result.confidence_summary.get('high', 0)}"
-                        f"/M{result.confidence_summary.get('medium', 0)}"
-                        f"/L{result.confidence_summary.get('low', 0)}"
-                        + (
-                            f" · {len(result.quality_issues)} item(s) need review"
-                            if result.quality_issues
-                            else ""
-                        )
-                    ),
-                    alignment=result.alignment,
-                    warnings=result.warnings,
-                    quality_issues=result.quality_issues,
-                    confidence_summary=result.confidence_summary,
-                    review_required=bool(result.quality_issues),
-                    download_url=f"/api/jobs/{identifier}/download",
-                    download_name=result.srt_path.name,
-                    output_path=str(result.srt_path),
-                    master_path=str(result.master_path),
-                )
+                    raise RuntimeError("Job disappeared from the local queue.")
+                completed = work(report, Path(snapshot["project"]))
+                self._update(identifier, status="complete", stage="complete", percent=100, **completed)
             except Exception as error:
                 self._update(
                     identifier,
                     status="failed",
                     stage="failed",
-                    message="Transcription failed",
+                    message=failure_message,
                     error=str(error),
                 )
 
         self.executor.submit(run)
+
+    def start_transcription(self, identifier: str, media: Path, language: str, alignment: str) -> None:
+        def work(report, project: Path) -> dict:
+            result = transcribe_media(
+                media,
+                project,
+                language=language,
+                alignment_mode=alignment,
+                model_path=self.model_path,
+                helper_path=self.helper_path,
+                whisperx_python=self.whisperx_python,
+                progress=report,
+            )
+            summary = result.confidence_summary
+            return {
+                "message": (
+                    f"SRT generated · confidence H{summary.get('high', 0)}"
+                    f"/M{summary.get('medium', 0)}/L{summary.get('low', 0)}"
+                    + (
+                        f" · {len(result.quality_issues)} item(s) need review"
+                        if result.quality_issues
+                        else ""
+                    )
+                ),
+                "alignment": result.alignment,
+                "warnings": result.warnings,
+                "quality_issues": result.quality_issues,
+                "confidence_summary": summary,
+                "review_required": bool(result.quality_issues),
+                "download_url": f"/api/jobs/{identifier}/download",
+                "download_name": result.srt_path.name,
+                "output_path": str(result.srt_path),
+                "master_path": str(result.master_path),
+            }
+
+        self._submit(
+            identifier,
+            work,
+            queued_message="Queued for local transcription",
+            failure_message="Transcription failed",
+        )
 
     def create_translation_job(
         self,
@@ -389,69 +405,77 @@ class JobManager:
             provider=provider,
             model=model,
         )
-        self._update(
-            identifier,
-            status="queued",
-            stage="queued",
-            percent=1,
-            message="Queued for subtitle translation",
-        )
-
-        def run() -> None:
-            self._update(
-                identifier,
-                status="running",
-                stage="translation",
-                percent=8,
-                message="Preparing stable subtitle IDs",
-            )
-
-            def report(stage: str, percent: int, message: str) -> None:
-                self._update(identifier, stage=stage, percent=percent, message=message)
-
-            try:
-                artifacts = run_translation_project(
-                    project,
-                    segments,
-                    source_language=source_language,
-                    model=model,
-                    provider_name=provider,
-                    source_filename=source_filename,
-                    progress=report,
-                )
-                self._update(
-                    identifier,
-                    status="complete",
-                    stage="complete",
-                    percent=100,
-                    message="Chinese subtitles generated",
-                    warnings=list(artifacts.warnings),
-                    segment_count=artifacts.segment_count,
-                    provider=artifacts.provider,
-                    model=artifacts.model,
-                    output_path=str(artifacts.zh_srt_path),
-                    download_name="zh.srt",
-                    download_url=f"/api/translate/{identifier}/download",
-                    translation_text_path=str(artifacts.translation_text_path),
-                    translation_text_name="translation_zh.txt",
-                    translation_text_url=(
-                        f"/api/translate/{identifier}/download?format=ids"
-                    ),
-                )
-            except Exception as error:
-                self._update(
-                    identifier,
-                    status="failed",
-                    stage="failed",
-                    message="Translation failed",
-                    error=str(error),
-                )
-
-        self.executor.submit(run)
+        self._submit_translation(identifier, segments, source_filename, source_language, model, provider)
         snapshot = self.snapshot(identifier)
         if snapshot is None:
             raise RuntimeError("Could not create the translation job.")
         return snapshot
+
+    def retry_translation(self, identifier: str) -> dict:
+        """Re-run a failed translation in its project, reusing validated batches."""
+        job = self.snapshot(identifier)
+        if job is None or job.get("kind") != "translation":
+            raise ValueError("Translation job not found.")
+        if job.get("status") != "failed":
+            raise ValueError("Only a failed translation can be retried.")
+        source = Path(job["project"]) / "source.srt"
+        if not source.is_file():
+            raise ValueError("The original subtitles are no longer available; start a new translation.")
+        segments = parse_srt_text(source.read_text(encoding="utf-8"))
+        self._update(identifier, error=None, warnings=[])
+        self._submit_translation(
+            identifier,
+            segments,
+            str(job.get("source_name") or "source.srt"),
+            str(job["source_language"]),
+            str(job["model"]),
+            str(job["provider"]),
+        )
+        snapshot = self.snapshot(identifier)
+        if snapshot is None:
+            raise RuntimeError("Could not requeue the translation job.")
+        return snapshot
+
+    def _submit_translation(
+        self,
+        identifier: str,
+        segments: list,
+        source_filename: str,
+        source_language: str,
+        model: str,
+        provider: str,
+    ) -> None:
+        def work(report, project: Path) -> dict:
+            artifacts = run_translation_project(
+                project,
+                segments,
+                source_language=source_language,
+                model=model,
+                provider_name=provider,
+                source_filename=source_filename,
+                progress=report,
+            )
+            return {
+                "message": "Chinese subtitles generated",
+                "warnings": list(artifacts.warnings),
+                "segment_count": artifacts.segment_count,
+                "provider": artifacts.provider,
+                "model": artifacts.model,
+                "output_path": str(artifacts.zh_srt_path),
+                "download_name": "zh.srt",
+                "download_url": f"/api/translate/{identifier}/download",
+                "translation_text_path": str(artifacts.translation_text_path),
+                "translation_text_name": "translation_zh.txt",
+                "translation_text_url": f"/api/translate/{identifier}/download?format=ids",
+            }
+
+        self._submit(
+            identifier,
+            work,
+            queued_message="Queued for subtitle translation",
+            failure_message="Translation failed",
+            running={"stage": "translation", "percent": 8, "message": "Preparing stable subtitle IDs"},
+        )
 
     def create_ass(self, source_name: str, source_text: str, chinese_name: str, chinese_text: str) -> dict:
         # Validate and build in memory first: a rejected pair (count mismatch,
@@ -734,52 +758,33 @@ class JobManager:
         return job, video
 
     def start_burn(self, identifier: str, video: Path, profile: str) -> None:
-        self._update(identifier, status="queued", stage="queued", percent=1, message="Queued for video encoding")
+        def work(report, project: Path) -> dict:
+            output_dir = project / "output"
+            output_dir.mkdir(exist_ok=True)
+            output = output_dir / f"{video.stem}.bilingual.mp4"
+            warnings: list[str] = []
+            burn_ass_into_video(
+                video,
+                project / "bilingual.ass",
+                output,
+                profile=profile,
+                progress=report,
+                warnings=warnings,
+            )
+            return {
+                "message": "Bilingual MP4 generated locally",
+                "warnings": warnings,
+                "download_url": f"/api/burn/{identifier}/download",
+                "download_name": output.name,
+                "output_path": str(output),
+            }
 
-        def run() -> None:
-            self._update(identifier, status="running")
-
-            def report(stage: str, percent: int, message: str) -> None:
-                self._update(identifier, stage=stage, percent=percent, message=message)
-
-            try:
-                snapshot = self.snapshot(identifier)
-                if snapshot is None:
-                    raise RuntimeError("Video job disappeared from the local queue.")
-                project = Path(snapshot["project"])
-                output_dir = project / "output"
-                output_dir.mkdir(exist_ok=True)
-                output = output_dir / f"{video.stem}.bilingual.mp4"
-                warnings: list[str] = []
-                burn_ass_into_video(
-                    video,
-                    project / "bilingual.ass",
-                    output,
-                    profile=profile,
-                    progress=report,
-                    warnings=warnings,
-                )
-                self._update(
-                    identifier,
-                    status="complete",
-                    stage="complete",
-                    percent=100,
-                    message="Bilingual MP4 generated locally",
-                    warnings=warnings,
-                    download_url=f"/api/burn/{identifier}/download",
-                    download_name=output.name,
-                    output_path=str(output),
-                )
-            except Exception as error:
-                self._update(
-                    identifier,
-                    status="failed",
-                    stage="failed",
-                    message="Video encoding failed",
-                    error=str(error),
-                )
-
-        self.executor.submit(run)
+        self._submit(
+            identifier,
+            work,
+            queued_message="Queued for video encoding",
+            failure_message="Video encoding failed",
+        )
 
     def environment(self) -> dict:
         configured_model = self.model_path or os.environ.get("SUBFLOW_MLX_MODEL")
@@ -938,6 +943,7 @@ class CueFlowHandler(BaseHTTPRequestHandler):
         ("_post_review_audit", re.compile(r"/api/review/audit"), False),
         ("_post_transcription", re.compile(r"/api/jobs"), True),
         ("_post_translation", re.compile(r"/api/translate"), True),
+        ("_post_translation_retry", re.compile(r"/api/translate/(?P<id>[^/]+)/retry"), True),
         ("_post_ass", re.compile(r"/api/ass"), True),
         ("_post_review", re.compile(r"/api/review"), True),
         ("_post_review_save", re.compile(r"/api/review/(?P<id>[^/]+)/save"), True),
@@ -1134,6 +1140,9 @@ class CueFlowHandler(BaseHTTPRequestHandler):
             str(payload.get("provider") or "codex"),
         )
         self._send_json(result, HTTPStatus.ACCEPTED)
+
+    def _post_translation_retry(self, _query: dict, *, id: str) -> None:
+        self._send_json(self.manager.retry_translation(id), HTTPStatus.ACCEPTED)
 
     def _post_ass(self, _query: dict) -> None:
         payload = self._read_json()

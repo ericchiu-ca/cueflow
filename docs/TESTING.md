@@ -101,6 +101,8 @@ cueflow burn --help
 
 `fix/remaining-findings` 分支（同日）：Python 3.11.15 与 3.12.14 各 101/101 通过；新增回归测试均在修复前代码上失败；ASS 渲染布局对未编辑样式的输出与修改前逐字节一致；VAD 级联黄金用例在加入进度上报后仍逐字节一致；真实 FFmpeg 验证烧录回退警告；浏览器验证审校台未保存提示、清理确认文案与轮询网络重试。
 
+`feat/resumable-jobs` 分支（同日）：Python 3.11.15 与 3.12.14 各 107/107 通过；用真实子进程和伪造的 `mlx_whisper` 在第 3 个片段强制崩溃，确认自动续跑只处理未完成片段、再次运行完全复用检查点；VAD 级联黄金用例逐字节一致；浏览器验证失败翻译的“重试”按钮流程（使用不可用的 Codex 路径，未向外部服务发送数据）。
+
 仓库中没有 JUnit artifact、coverage artifact 或 release verification record。公开历史从当前快照开始；更早代码状态及其测试结果**无法从本仓库确认**。
 
 ## CI 覆盖范围

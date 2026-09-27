@@ -174,11 +174,65 @@ class TranslationTests(unittest.TestCase):
             self.assertEqual(len(provider.requests), 3)  # batch 2 needed a retry
             self.assertIn("译0005", artifacts.zh_srt_path.read_text(encoding="utf-8"))
 
+        with tempfile.TemporaryDirectory() as directory:
             provider = RecordingProvider(broken_attempts={2, 3})
             with self.assertRaisesRegex(TranslationError, r"Batch 2/2 \(0004-0005\) failed after 2 attempts.*Missing"):
                 run_translation_project(
                     Path(directory), segments, source_language="en", provider_instance=provider, batch_size=3
                 )
+
+    def test_setup_errors_are_not_retried(self):
+        from subflow.translation import TranslationSetupError
+
+        class NotLoggedIn(RecordingProvider):
+            def translate(self, request, output_path, progress=None):
+                self.requests.append(request)
+                raise TranslationSetupError("Codex is not logged in")
+
+        provider = NotLoggedIn()
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(TranslationSetupError, "not logged in"):
+                run_translation_project(
+                    Path(directory), parse_srt_text(numbered_srt(2)), source_language="en", provider_instance=provider
+                )
+        self.assertEqual(len(provider.requests), 1)
+
+    def test_rerun_resumes_from_validated_batches_only(self):
+        segments = parse_srt_text(numbered_srt(7))
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            failing = RecordingProvider(broken_attempts={2, 3})  # batch 2 fails twice
+            with self.assertRaises(TranslationError):
+                run_translation_project(project, segments, source_language="en", provider_instance=failing, batch_size=3)
+            self.assertEqual(len(failing.requests), 3)
+
+            resumed = RecordingProvider()
+            messages = []
+            run_translation_project(
+                project,
+                segments,
+                source_language="en",
+                provider_instance=resumed,
+                batch_size=3,
+                progress=lambda _stage, _percent, message: messages.append(message),
+            )
+            # Batch 1 came from its checkpoint; only batches 2 and 3 were requested.
+            self.assertEqual([r.segments[0].id for r in resumed.requests], ["0004", "0007"])
+            self.assertTrue(any("Batch 1/3 reused" in m for m in messages))
+
+            # Changing the source text invalidates that batch's checkpoint.
+            edited = list(segments)
+            edited[0] = type(edited[0])(edited[0].id, edited[0].start, edited[0].end, "Changed", [])
+            again = RecordingProvider()
+            run_translation_project(project, edited, source_language="en", provider_instance=again, batch_size=3)
+            self.assertEqual([r.segments[0].id for r in again.requests], ["0001"])
+
+            # A different model must not reuse any batch.
+            other_model = RecordingProvider()
+            run_translation_project(
+                project, segments, source_language="en", model="gpt-5.6-sol", provider_instance=other_model, batch_size=3
+            )
+            self.assertEqual(len(other_model.requests), 3)
 
     def test_codex_command_is_read_only_and_model_selectable(self):
         segments = tuple(parse_srt_text(SOURCE_SRT))
