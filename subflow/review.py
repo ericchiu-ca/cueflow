@@ -15,21 +15,32 @@ class ReviewIssue:
     message: str
 
 
-def audit_review_segments(
-    segments: Iterable[SubtitleSegment],
+# Character budgets per track; the web UI shows exactly these rules because
+# it asks /api/review/audit instead of re-implementing them.
+MAX_CHARS_BY_TRACK = {"source": 90, "chinese": 45}
+MIN_DURATION_SECONDS = 0.8
+
+
+def _audit_ordered(
+    ordered: list[SubtitleSegment],
     *,
-    min_duration: float = 0.8,
-    max_source_chars: int = 90,
-) -> dict[str, list[ReviewIssue]]:
-    ordered = list(segments)
-    issues: dict[str, list[ReviewIssue]] = {segment.id: [] for segment in ordered}
+    min_duration: float,
+    max_source_chars: int,
+) -> list[list[ReviewIssue]]:
+    results: list[list[ReviewIssue]] = []
     for index, segment in enumerate(ordered):
-        current = issues[segment.id]
+        current: list[ReviewIssue] = []
+        results.append(current)
         text = segment.text.strip()
         if not text:
             current.append(ReviewIssue("ERROR", "EMPTY_TEXT", "字幕文本为空"))
         duration = segment.end - segment.start
-        if segment.start < 0 or duration <= 0:
+        if (
+            not math.isfinite(segment.start)
+            or not math.isfinite(segment.end)
+            or segment.start < 0
+            or duration <= 0
+        ):
             current.append(ReviewIssue("ERROR", "INVALID_TIME", "结束时间必须晚于开始时间"))
         elif duration < min_duration:
             current.append(
@@ -58,7 +69,57 @@ def audit_review_segments(
                 current.append(
                     ReviewIssue("WARN", "REPEATED_TEXT", f"文本与上一条 {previous.id} 相同")
                 )
-    return issues
+    return results
+
+
+def audit_review_segments(
+    segments: Iterable[SubtitleSegment],
+    *,
+    min_duration: float = MIN_DURATION_SECONDS,
+    max_source_chars: int = 90,
+) -> dict[str, list[ReviewIssue]]:
+    ordered = list(segments)
+    results = _audit_ordered(ordered, min_duration=min_duration, max_source_chars=max_source_chars)
+    return {segment.id: issues for segment, issues in zip(ordered, results)}
+
+
+def _lenient_number(value: object) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return math.nan
+
+
+def lenient_segments(raw_segments: object) -> list[SubtitleSegment]:
+    """Editor segments as-is; invalid numbers become NaN rather than errors."""
+    if not isinstance(raw_segments, list):
+        raise ValueError("Review audit request must contain a segment list.")
+    return [
+        SubtitleSegment(
+            id=str(item.get("id", "")) if isinstance(item, Mapping) else "",
+            start=_lenient_number(item.get("start")) if isinstance(item, Mapping) else math.nan,
+            end=_lenient_number(item.get("end")) if isinstance(item, Mapping) else math.nan,
+            text=str(item.get("text") or "") if isinstance(item, Mapping) else "",
+            words=[],
+        )
+        for item in raw_segments
+    ]
+
+
+def audit_review_track(raw_segments: object, track: str) -> list[list[dict]]:
+    """Audit an in-progress editor track, returning issues by position.
+
+    Unlike saving, this never rejects input: half-edited values (blank times,
+    duplicate IDs) must still produce the same issues the save would show.
+    """
+    if track not in MAX_CHARS_BY_TRACK:
+        raise ValueError("Review track must be source or chinese.")
+    results = _audit_ordered(
+        lenient_segments(raw_segments),
+        min_duration=MIN_DURATION_SECONDS,
+        max_source_chars=MAX_CHARS_BY_TRACK[track],
+    )
+    return [[asdict(issue) for issue in issues] for issues in results]
 
 
 def review_payload(

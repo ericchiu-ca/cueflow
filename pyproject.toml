@@ -8,8 +8,8 @@ version = "0.4.0"
 description = "Local-first subtitle transcription, translation, review, ASS, and video workflow for Apple Silicon macOS"
 readme = "README.md"
 requires-python = ">=3.11"
-license = "MIT"
-license-files = ["LICENSE", "assets/fonts/LICENSE-*.txt"]
+license = "MIT AND OFL-1.1"
+license-files = ["LICENSE", "subflow/fonts/LICENSE-*.txt", "subflow/fonts/NOTICE-*.txt"]
 keywords = ["subtitles", "whisper", "whisperx", "mlx", "srt", "ass", "ffmpeg"]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -41,15 +41,5 @@ where = ["."]
 include = ["subflow*"]
 
 [tool.setuptools.package-data]
-subflow = ["static/*.html", "schemas/*.json"]
+subflow = ["static/*.html", "schemas/*.json", "fonts/*"]
 
-[tool.setuptools.data-files]
-"share/cueflow/fonts" = [
-  "assets/fonts/Inter-Medium.ttf",
-  "assets/fonts/Mulish-SemiBold.ttf",
-  "assets/fonts/CueFlowHanSansSC-SemiBold.otf",
-  "assets/fonts/LICENSE-Inter.txt",
-  "assets/fonts/LICENSE-Mulish.txt",
-  "assets/fonts/LICENSE-SourceHanSans.txt",
-  "assets/fonts/NOTICE-CueFlowHanSansSC.txt",
-]

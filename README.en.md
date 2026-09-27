@@ -197,4 +197,4 @@ The current public baseline passes all 51 unit tests on Python 3.11 and 3.12 whe
 
 ## License
 
-The repository currently contains an [MIT License](LICENSE). Bundled CueFlow Han Sans SC, Mulish, and Inter fonts retain the separate OFL texts and modification notice included in `assets/fonts/`.
+The repository currently contains an [MIT License](LICENSE). Bundled CueFlow Han Sans SC, Mulish, and Inter fonts retain the separate OFL texts and modification notice included in `subflow/fonts/`.

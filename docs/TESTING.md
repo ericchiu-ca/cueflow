@@ -97,6 +97,8 @@ cueflow burn --help
 
 新增的每个回归测试都在修复前的代码上失败、修复后通过。
 
+`refactor/followups` 分支（同日）：Python 3.11.15 与 3.12.14 各 84/84 通过；wheel 在独立 venv 中确认字体、schema 与静态页随包安装；`pip install --user` 场景下字体可被找到（旧版本找不到）；`transcribe_vad_cascade` 拆分前后对 7 个语音窗的 en/mixed 黄金用例输出逐字节一致；真实启动 `cueflow web` 验证审校台的后端审计、按时间配对提示与各路由。
+
 仓库中没有 JUnit artifact、coverage artifact 或 release verification record。公开历史从当前快照开始；更早代码状态及其测试结果**无法从本仓库确认**。
 
 ## CI 覆盖范围

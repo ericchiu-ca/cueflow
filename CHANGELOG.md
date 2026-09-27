@@ -18,6 +18,11 @@
 
 ### Changed
 
+- Web 处理器改为路由表（每个接口一个方法，统一 Host/CSRF 校验与错误处理，POST 路由声明是否写文件）；`transcribe_vad_cascade` 拆分为升级原因、重试语言、候选选择、问题生成和汇总等小函数，行为不变。
+- Codex 翻译按每批 120 条分批进行，附带前后各 3 条只读上下文；每批单独校验、失败重试一次，进度按批次显示。长视频不再依赖单次输出覆盖全部 ID。Codex 登录状态每个任务只检查一次。
+- 审校规则只在后端实现：审校台通过新的只读接口 `POST /api/review/audit` 获取问题和双轨配对状态，不再在页面里复制一份规则。此前两份实现已出现差异（重复文本是否忽略空白、非有限时间是否报错、提示文案）。
+- 字体从 `assets/fonts/` 移到 `subflow/fonts/`，作为 package data 随包安装；`pip install --user` 等非 `sys.prefix` 安装方式不再找不到字体。License 表达式改为 `MIT AND OFL-1.1`，字体许可证与修改说明一并写入 wheel 元数据。
+- 三份 FFmpeg 查找逻辑合并为 `subflow/ffmpeg_tools.py`，探测结果按路径、修改时间和大小缓存。
 - CI matrix 增加 Python 3.12，并在仓库外用独立 venv 安装 wheel 做 smoke test，以发现打包遗漏的资源文件。
 - 将安装、模型配置、Codex 数据边界、测试命令和已知限制整理为当前公开基线的实际行为。
 - 将 `requirements.txt` 的 `yt-dlp` 下限统一为 manifest 使用的 `>=2024.1`。
@@ -44,6 +49,8 @@
 - YouTube 字幕检测改用 yt-dlp 的结构化 JSON；原先按 `--list-subs` 文本匹配 "automatic subtitles"，而 yt-dlp 实际输出 "automatic captions"，导致自动字幕被当成人工字幕。自动字幕只接受原始语音轨（`en-orig`），不再把非英语视频的机器翻译当作英文原文。
 - Web 响应增加 `X-Frame-Options: DENY`、`frame-ancestors 'none'`、`nosniff` 和 `no-referrer`，防止页面被第三方网站嵌入做点击劫持。
 - QC 与审校共用稳定 ID 规则（4 位以上数字）；超过 9999 条字幕时 QC 不再误报 `INVALID_ID`。
+- ASS 生成和审校创建先在内存中校验，通过后才创建项目目录；创建后的步骤失败、上传中断时删除对应项目目录，不再留下空目录。删除只作用于输出目录下受管类别中的单个项目目录。
+- 中英轨在同一时间轴上时按时间校验配对：条数相同但中间删一条、别处补一条的情况会被拒绝，并指出从哪一条开始错开；时间轴无关的两轨仍按顺序配对。审校台同步显示错位位置。
 - 合并并持续读取 FFmpeg 输出，避免管道阻塞；为 YouTube 外部命令增加可运行性检查与超时。
 - 上传先写入临时文件再原子重命名，失败任务会进入失败状态。
 - wheel 包含 Web 静态文件、JSON Schema 和字体资源。

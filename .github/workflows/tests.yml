@@ -33,5 +33,5 @@ jobs:
           python -m venv "$RUNNER_TEMP/wheel-venv"
           "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install dist/cueflow_subtitles-*.whl
           cd "$RUNNER_TEMP"
-          "$RUNNER_TEMP/wheel-venv/bin/python" -c "from subflow.translation import TRANSLATION_SCHEMA; from subflow.web import STATIC_FILE; assert TRANSLATION_SCHEMA.is_file(), TRANSLATION_SCHEMA; assert STATIC_FILE.is_file(), STATIC_FILE"
+          "$RUNNER_TEMP/wheel-venv/bin/python" -c "from subflow.translation import TRANSLATION_SCHEMA; from subflow.web import STATIC_FILE; assert TRANSLATION_SCHEMA.is_file(), TRANSLATION_SCHEMA; assert STATIC_FILE.is_file(), STATIC_FILE; from subflow.bilingual import DEFAULT_FONTS_DIR, SOURCE_HAN_FONT, MULISH_FONT; assert all((DEFAULT_FONTS_DIR / name).is_file() for name in (SOURCE_HAN_FONT, MULISH_FONT)), DEFAULT_FONTS_DIR"
           "$RUNNER_TEMP/wheel-venv/bin/cueflow" --help > /dev/null

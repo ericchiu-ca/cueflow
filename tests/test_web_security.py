@@ -2,6 +2,7 @@ import http.client
 import json
 import os
 import shutil
+import socket
 import tempfile
 import threading
 import unittest
@@ -225,6 +226,65 @@ class WebRobustnessTests(unittest.TestCase):
             finally:
                 fixture.close()
 
+    def test_review_audit_endpoint_returns_rules_and_pairing(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            fixture = ServerFixture(Path(temp_value) / "output")
+            try:
+                body = json.dumps(
+                    {
+                        "tracks": {
+                            "source": [
+                                {"id": "0001", "start": 1, "end": 2, "text": "A"},
+                                {"id": "0002", "start": 3, "end": 4, "text": ""},
+                            ],
+                            "chinese": [
+                                {"id": "0001", "start": 1, "end": 2, "text": "甲"},
+                                {"id": "0002", "start": 9, "end": 10, "text": "乙"},
+                            ],
+                        }
+                    }
+                ).encode("utf-8")
+                connection = http.client.HTTPConnection("127.0.0.1", fixture.server.server_address[1], timeout=5)
+                connection.request(
+                    "POST",
+                    "/api/review/audit",
+                    body=body,
+                    headers={"X-CueFlow-CSRF": "test-token", "Content-Type": "application/json"},
+                )
+                response = connection.getresponse()
+                payload = json.loads(response.read())
+                connection.close()
+                self.assertEqual(response.status, 200)
+                self.assertEqual([issue["code"] for issue in payload["tracks"]["source"][1]], ["EMPTY_TEXT"])
+                self.assertEqual(payload["pairing"]["drifted_ids"], ["0002"])
+                # Audit writes nothing, so it must not create project folders.
+                self.assertEqual(list((Path(temp_value) / "output").iterdir()), [])
+            finally:
+                fixture.close()
+
+    def test_route_tables_resolve_each_path_to_one_existing_handler(self):
+        for routes in (CueFlowHandler.GET_ROUTES, CueFlowHandler.POST_ROUTES):
+            for route in routes:
+                self.assertTrue(callable(getattr(CueFlowHandler, route[0], None)), route[0])
+        expectations = {
+            ("GET", "/"): "_get_index",
+            ("GET", "/api/jobs/abc/"): "_get_job",
+            ("GET", "/api/ass/abc/download"): "_get_ass_download",
+            ("GET", "/api/burn/abc/download"): "_get_job_download",
+            ("POST", "/api/ass"): "_post_ass",
+            ("POST", "/api/ass-assets"): "_post_ass_asset",
+            ("POST", "/api/review/audit"): "_post_review_audit",
+            ("POST", "/api/review/abc/save"): "_post_review_save",
+        }
+        for (method, path), handler in expectations.items():
+            routes = CueFlowHandler.GET_ROUTES if method == "GET" else CueFlowHandler.POST_ROUTES
+            matches = [r[0] for r in routes if r[1].fullmatch(path.rstrip("/") or "/")]
+            self.assertEqual(matches, [handler], (method, path))
+        writes = {r[0]: r[2] for r in CueFlowHandler.POST_ROUTES}
+        self.assertFalse(writes["_post_cleanup"])
+        self.assertFalse(writes["_post_review_audit"])
+        self.assertTrue(all(v for k, v in writes.items() if k not in {"_post_cleanup", "_post_review_audit"}))
+
     def test_unexpected_get_error_returns_json_500(self):
         with tempfile.TemporaryDirectory() as temp_value:
             fixture = ServerFixture(Path(temp_value) / "output")
@@ -258,6 +318,95 @@ class WebRobustnessTests(unittest.TestCase):
                 self.assertTrue((project / "output" / "reviewed.source.srt").is_file())
                 self.assertTrue((project / "output" / "reviewed.zh.srt").is_file())
                 self.assertEqual(saved["pairing"]["matched"], True)
+            finally:
+                manager.executor.shutdown(wait=True, cancel_futures=True)
+
+    def test_review_pairing_reports_time_drift_with_equal_counts(self):
+        source_srt = "1\n00:00:01,000 --> 00:00:02,000\nA\n\n2\n00:00:03,000 --> 00:00:04,000\nB\n\n3\n00:00:05,000 --> 00:00:06,000\nC\n"
+        chinese_srt = "1\n00:00:01,000 --> 00:00:02,000\n甲\n\n2\n00:00:05,000 --> 00:00:06,000\n丙\n\n3\n00:00:07,000 --> 00:00:08,000\n丁\n"
+        with tempfile.TemporaryDirectory() as temp_value:
+            manager = make_manager(Path(temp_value) / "output")
+            try:
+                review = manager.create_review("a.srt", source_srt, "zh.srt", chinese_srt)
+                self.assertFalse(review["pairing"]["matched"])
+                self.assertEqual(review["pairing"]["drifted_ids"], ["0002", "0003"])
+                self.assertEqual(review["pairing"]["first_divergence"]["id"], "0002")
+            finally:
+                manager.executor.shutdown(wait=True, cancel_futures=True)
+
+    def test_rejected_requests_leave_no_project_directories(self):
+        source_srt = "1\n00:00:01,000 --> 00:00:02,000\nA\n\n2\n00:00:03,000 --> 00:00:04,000\nB\n"
+        drifted_srt = "1\n00:00:01,000 --> 00:00:02,000\n甲\n\n2\n00:00:09,000 --> 00:00:10,000\n乙\n"
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value) / "output"
+            manager = make_manager(root)
+            try:
+                with patch("subflow.web.render_bilingual_preview") as preview:
+                    with self.assertRaisesRegex(ValueError, "out of step"):
+                        manager.create_ass("a.srt", source_srt, "zh.srt", drifted_srt)
+                    with self.assertRaisesRegex(ValueError, "count mismatch"):
+                        manager.create_ass("a.srt", source_srt, "zh.srt", drifted_srt.split("\n\n")[0])
+                    preview.assert_not_called()
+                with self.assertRaisesRegex(ValueError, "Chinese SRT contains no usable"):
+                    manager.create_review("a.srt", source_srt, "zh.srt", "not an srt")
+                with (
+                    patch("subflow.web.render_bilingual_preview"),
+                    patch.object(Path, "write_text", side_effect=OSError("disk full")),
+                ):
+                    with self.assertRaisesRegex(OSError, "disk full"):
+                        manager.create_ass("a.srt", source_srt, "zh.srt", source_srt)
+                leftovers = [p for p in root.rglob("*")] if root.exists() else []
+                self.assertEqual([p for p in leftovers if p.is_dir() and p.parent != root], [])
+            finally:
+                manager.executor.shutdown(wait=True, cancel_futures=True)
+
+    def test_interrupted_uploads_leave_no_project_directories(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value) / "output"
+            fixture = ServerFixture(root)
+            try:
+                for path in ("/api/ass-assets?filename=a.ass", "/api/jobs?filename=talk.mp4&language=en"):
+                    with socket.create_connection(("127.0.0.1", fixture.server.server_address[1]), timeout=5) as raw:
+                        raw.sendall(
+                            (
+                                f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                                "X-CueFlow-CSRF: test-token\r\nContent-Length: 1000\r\n\r\npartial"
+                            ).encode()
+                        )
+                        raw.shutdown(socket.SHUT_WR)
+                        chunks = []
+                        while chunk := raw.recv(4096):
+                            chunks.append(chunk)
+                        response = b"".join(chunks).decode(errors="replace")
+                    self.assertIn(" 400 ", response.splitlines()[0])
+                    self.assertIn("Upload ended before", response)
+                project_dirs = [p for p in root.glob("*/*") if p.is_dir()]
+                self.assertEqual(project_dirs, [])
+                failed = [job for job in fixture.manager.jobs.values() if job["status"] == "failed"]
+                self.assertEqual(len(failed), 1)  # the transcription job is still reported
+            finally:
+                fixture.close()
+
+    def test_discard_project_only_removes_managed_project_directories(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value) / "output"
+            manager = make_manager(root)
+            try:
+                outside = Path(temp_value) / "keep"
+                outside.mkdir()
+                unmanaged = root / "mine" / "project"
+                unmanaged.mkdir(parents=True)
+                category = root / "reviews"
+                category.mkdir()
+                for candidate in (outside, unmanaged, category, root):
+                    manager.discard_project(candidate)
+                self.assertTrue(outside.is_dir())
+                self.assertTrue(unmanaged.is_dir())
+                self.assertTrue(category.is_dir())
+                managed = root / "reviews" / "20260926-a-1234"
+                managed.mkdir()
+                manager.discard_project(managed)
+                self.assertFalse(managed.exists())
             finally:
                 manager.executor.shutdown(wait=True, cancel_futures=True)
 
