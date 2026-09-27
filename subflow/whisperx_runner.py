@@ -7,6 +7,8 @@ import sys
 import traceback
 from pathlib import Path
 
+from .mlx_batch_runner import _json_value
+
 
 def main() -> int:
     try:
@@ -42,7 +44,8 @@ def main() -> int:
                 "cpu",
                 return_char_alignments=False,
             )
-        json.dump(result, sys.stdout, ensure_ascii=False)
+        # WhisperX can emit NaN timings; plain json.dump would write bare NaN.
+        json.dump(_json_value(result), sys.stdout, ensure_ascii=False, allow_nan=False)
         sys.stdout.write("\n")
         return 0
     except Exception as error:

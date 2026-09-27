@@ -326,6 +326,23 @@ class TestAdvancedAsr(unittest.TestCase):
                         environment_factory=dict,
                     )
 
+    def test_metrics_ignore_non_finite_values(self):
+        from subflow.advanced_asr import _metrics
+
+        metrics = _metrics(
+            {
+                "segments": [
+                    {"start": 0.0, "end": float("nan"), "avg_logprob": float("nan"), "words": [{"probability": float("nan")}]},
+                    {"start": 0.0, "end": 1.0, "avg_logprob": -0.2, "words": [{"probability": 0.9}]},
+                ]
+            },
+            2.0,
+        )
+        for value in metrics.values():
+            if isinstance(value, float):
+                self.assertTrue(value == value, metrics)  # no NaN leaks into scoring
+        self.assertEqual(metrics["avg_logprob"], -0.2)
+
     def test_whisperx_chunk_dicts_are_converted_to_spans(self):
         self.assertEqual(
             _chunk_spans(

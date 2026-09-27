@@ -55,6 +55,17 @@ But the labor market remains surprisingly strong.
             path.write_bytes(sample.encode("utf-8"))
             self.assertEqual(len(parse_srt_file(path)), 2)
 
+    def test_parse_srt_accepts_cue_settings_and_names_bad_blocks(self):
+        segments = parse_srt_text(
+            "1\n00:00:01,000 --> 00:00:02,000 X1:10 X2:20 Y1:5 Y2:9\nPositioned\n\n"
+            "2\n00:00:03,000-->00:00:04,000\nTight arrow\n"
+        )
+        self.assertEqual([(s.start, s.end, s.text) for s in segments], [(1.0, 2.0, "Positioned"), (3.0, 4.0, "Tight arrow")])
+        with self.assertRaisesRegex(ValueError, "block 2"):
+            parse_srt_text("1\n00:00:01,000 --> 00:00:02,000\nA\n\n2\n00:00:03,000 --> 00:00:04,000 --> 00:00:05,000\nB\n")
+        with self.assertRaisesRegex(ValueError, "block 1"):
+            parse_srt_text("1\n00:00:01,000 --> 4\nA\n")
+
     def test_parse_srt_preserves_millisecond_timing_round_trip(self):
         sample = "1\n00:00:01,234 --> 00:00:02,567\nPrecise\n\n2\n00:00:03,001 --> 00:00:03,004\nShort\n"
         segments = parse_srt_text(sample)
@@ -182,6 +193,26 @@ class TestLocalTranscription(unittest.TestCase):
         self.assertEqual(segments[0].start, 1.234)
         self.assertEqual(segments[0].text, "Bonjour Montreal.")
         self.assertEqual(segments[0].words[0]["probability"], 0.98)
+
+    def test_non_finite_timings_are_dropped(self):
+        nan, inf = float("nan"), float("inf")
+        segments = segments_from_result(
+            {
+                "segments": [
+                    {"start": nan, "end": 2.0, "text": "nan start"},
+                    {"start": 1.0, "end": inf, "text": "inf end"},
+                    {
+                        "start": 3.0,
+                        "end": 4.0,
+                        "text": "kept",
+                        "words": [{"word": "kept", "start": nan, "end": 4.0, "probability": 0.9}],
+                    },
+                ]
+            },
+            enforce_transcript_quality=False,
+        )
+        self.assertEqual([s.text for s in segments], ["kept"])
+        self.assertEqual(segments[0].words, [{"word": "kept", "end": 4.0, "probability": 0.9}])
 
     def test_mlx_quality_gate_rejects_repetition_and_high_compression(self):
         repeated = {

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, List, Dict
 
 SRT_TIMEPOINT_RE = re.compile(r"^(\d+):(\d{2}):(\d{2})[.,](\d{3})$")
+SRT_TIME_LINE_RE = re.compile(r"^\s*(\S+)\s*-->\s*(\S+)(?:\s+.*)?$")
 ID_TAG_RE = re.compile(r"^\[(\d+)\]\s*$")
 # stable_id() zero-pads to 4 digits and grows past 9999 cues.
 STABLE_ID_RE = re.compile(r"\d{4,}")
@@ -121,7 +122,7 @@ def parse_srt_text(raw: str) -> List[SubtitleSegment]:
     blocks = [b.strip() for b in normalized.split("\n\n") if b.strip()]
     parsed: List[SubtitleSegment] = []
 
-    for block in blocks:
+    for block_number, block in enumerate(blocks, start=1):
         lines = [line.rstrip() for line in block.split("\n") if line.strip() != ""]
         if len(lines) < 2:
             continue
@@ -137,9 +138,16 @@ def parse_srt_text(raw: str) -> List[SubtitleSegment]:
 
         if "-->" not in time_line:
             continue
-        start_raw, end_raw = [x.strip() for x in time_line.split("-->")]
-        start = round(_to_seconds(start_raw), 3)
-        end = round(_to_seconds(end_raw), 3)
+        # Cue settings may follow the end time (e.g. "X1:10 X2:20" or VTT-style
+        # "position:50%"); only the two timestamps matter here.
+        match = SRT_TIME_LINE_RE.match(time_line) if time_line.count("-->") == 1 else None
+        if not match:
+            raise ValueError(f"Invalid SRT time line in block {block_number}: {time_line!r}")
+        try:
+            start = round(_to_seconds(match.group(1)), 3)
+            end = round(_to_seconds(match.group(2)), 3)
+        except ValueError as error:
+            raise ValueError(f"{error} (block {block_number})") from error
         if end <= start:
             continue
 

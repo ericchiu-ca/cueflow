@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import tempfile
@@ -141,8 +142,16 @@ def _batch_results(
     return {str(item.get("id", "")): item for item in response.get("items", [])}
 
 
+def _finite(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
 def _float_values(items: list[dict], key: str) -> list[float]:
-    return [float(item[key]) for item in items if isinstance(item.get(key), (int, float))]
+    values = (_finite(item.get(key)) for item in items)
+    return [value for value in values if value is not None]
 
 
 def _metrics(result: dict, duration: float) -> dict:
@@ -153,15 +162,15 @@ def _metrics(result: dict, duration: float) -> dict:
     word_scores: list[float] = []
     speech_duration = 0.0
     for segment in raw_segments:
-        start = segment.get("start")
-        end = segment.get("end")
-        if isinstance(start, (int, float)) and isinstance(end, (int, float)):
-            speech_duration += max(0.0, float(end) - float(start))
+        start = _finite(segment.get("start"))
+        end = _finite(segment.get("end"))
+        if start is not None and end is not None:
+            speech_duration += max(0.0, end - start)
         for word in segment.get("words", []) or []:
             if isinstance(word, dict):
-                value = word.get("probability", word.get("score"))
-                if isinstance(value, (int, float)):
-                    word_scores.append(float(value))
+                value = _finite(word.get("probability", word.get("score")))
+                if value is not None:
+                    word_scores.append(value)
     return {
         "avg_logprob": mean(logprobs) if logprobs else None,
         "max_compression_ratio": max(ratios) if ratios else None,

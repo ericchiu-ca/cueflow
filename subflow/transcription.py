@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 import re
 import subprocess
@@ -271,6 +272,14 @@ def _run_ffmpeg_clip(
     )
 
 
+def _finite(value: object) -> float | None:
+    """A real, finite number from untrusted JSON, else None (bools and NaN excluded)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
 def _normalize_words(raw_words: object) -> list[dict]:
     if not isinstance(raw_words, list):
         return []
@@ -283,9 +292,9 @@ def _normalize_words(raw_words: object) -> list[dict]:
             continue
         normalized: dict = {"word": word}
         for key in ("start", "end", "score", "probability"):
-            value = item.get(key)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                normalized[key] = round(float(value), 3)
+            value = _finite(item.get(key))
+            if value is not None:
+                normalized[key] = round(value, 3)
         words.append(normalized)
     return words
 
@@ -467,22 +476,15 @@ def segments_from_result(
         if not isinstance(item, Mapping):
             continue
         text = str(item.get("text", "")).strip()
-        start = item.get("start")
-        end = item.get("end")
-        if (
-            not text
-            or not isinstance(start, (int, float))
-            or isinstance(start, bool)
-            or not isinstance(end, (int, float))
-            or isinstance(end, bool)
-            or float(end) <= float(start)
-        ):
+        start = _finite(item.get("start"))
+        end = _finite(item.get("end"))
+        if not text or start is None or end is None or end <= start:
             continue
         segments.append(
             SubtitleSegment(
                 id="",
-                start=float(start),
-                end=float(end),
+                start=start,
+                end=end,
                 text=text,
                 words=_normalize_words(item.get("words")),
             )
