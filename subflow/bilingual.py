@@ -16,6 +16,7 @@ from statistics import median
 from typing import Callable, Iterable
 
 from .core import SubtitleSegment, parse_srt_file
+from .proc import kill_tree, popen, release
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -771,6 +772,7 @@ def burn_ass_into_video(
         (temp / "fonts").symlink_to(fonts, target_is_directory=True)
         command = [
             str(ffmpeg),
+            "-nostdin",
             "-hide_banner",
             "-loglevel",
             "error",
@@ -802,7 +804,7 @@ def burn_ass_into_video(
             str(output),
         ]
         try:
-            process = subprocess.Popen(
+            process = popen(
                 command,
                 cwd=temp,
                 stdout=subprocess.PIPE,
@@ -816,19 +818,29 @@ def burn_ass_into_video(
         assert process.stdout is not None
         last_percent = 3
         output_tail: deque[str] = deque(maxlen=200)
-        for raw_line in process.stdout:
-            output_tail.append(raw_line)
-            key, separator, value = raw_line.strip().partition("=")
-            if separator and key == "out_time_us" and duration:
-                try:
-                    elapsed = int(value) / 1_000_000
-                except ValueError:
-                    continue
-                percent = min(98, max(3, int(elapsed / duration * 95) + 3))
-                if percent >= last_percent + 2:
-                    last_percent = percent
-                    report("encoding", percent, f"Burning subtitles into video ({percent}%)")
-        return_code = process.wait()
+        try:
+            for raw_line in process.stdout:
+                output_tail.append(raw_line)
+                key, separator, value = raw_line.strip().partition("=")
+                if separator and key == "out_time_us" and duration:
+                    try:
+                        elapsed = int(value) / 1_000_000
+                    except ValueError:
+                        continue
+                    percent = min(98, max(3, int(elapsed / duration * 95) + 3))
+                    if percent >= last_percent + 2:
+                        last_percent = percent
+                        report("encoding", percent, f"Burning subtitles into video ({percent}%)")
+            return_code = process.wait()
+        except BaseException:
+            # A failing progress callback or interrupt must not leave FFmpeg
+            # running with a full pipe and a half-written MP4.
+            kill_tree(process)
+            output.unlink(missing_ok=True)
+            raise
+        finally:
+            process.stdout.close()
+            release(process)
         if return_code != 0:
             output.unlink(missing_ok=True)
             detail = "".join(output_tail).strip()

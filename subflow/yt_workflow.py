@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 from .core import SubtitleSegment
+from .proc import run_captured
 
 YT_DLP = "yt-dlp"
 FFMPEG_FULL_PATH = Path("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg")
@@ -69,14 +70,7 @@ def run_command(
     timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT,
 ) -> str:
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(cwd) if cwd else None,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout_seconds,
-        )
+        proc = run_captured(cmd, cwd=cwd, timeout=timeout_seconds)
     except subprocess.TimeoutExpired as error:
         raise RuntimeError(
             f"Command timed out after {timeout_seconds} seconds: {cmd[0]}"

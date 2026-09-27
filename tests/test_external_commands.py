@@ -35,8 +35,8 @@ class ExternalCommandTests(unittest.TestCase):
 
     def test_external_command_timeout_is_reported(self):
         with patch.object(
-            workflow.subprocess,
-            "run",
+            workflow,
+            "run_captured",
             side_effect=subprocess.TimeoutExpired(["yt-dlp"], 1),
         ):
             with self.assertRaisesRegex(RuntimeError, "timed out"):

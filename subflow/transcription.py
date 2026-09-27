@@ -18,6 +18,7 @@ from .core import (
     normalize_segments,
     save_master_json,
 )
+from .proc import run_captured
 
 
 FRAMELEDGER_ROOT = Path.home() / "Documents" / "FrameLedger"
@@ -231,10 +232,27 @@ def _ffmpeg_subprocess_env() -> dict[str, str]:
     return environment
 
 
+FFMPEG_EXTRACT_TIMEOUT_SECONDS = 3 * 3600
+FFMPEG_CLIP_TIMEOUT_SECONDS = 600
+
+
+def _run_ffmpeg_checked(command: list[str], *, timeout: float, what: str) -> None:
+    try:
+        completed = run_captured(command, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise TranscriptionError(f"ffmpeg timed out after {timeout:.0f}s while trying to {what}") from error
+    except OSError as error:
+        raise TranscriptionError(f"ffmpeg could not start: {error}") from error
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()[-2000:]
+        raise TranscriptionError(f"ffmpeg could not {what}: {detail}")
+
+
 def _run_ffmpeg(source: Path, wav_path: Path) -> None:
-    completed = subprocess.run(
+    _run_ffmpeg_checked(
         [
             _ensure_ffmpeg(),
+            "-nostdin",
             "-hide_banner",
             "-loglevel",
             "error",
@@ -250,13 +268,9 @@ def _run_ffmpeg(source: Path, wav_path: Path) -> None:
             "pcm_s16le",
             str(wav_path),
         ],
-        capture_output=True,
-        text=True,
-        check=False,
+        timeout=FFMPEG_EXTRACT_TIMEOUT_SECONDS,
+        what="extract audio",
     )
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout).strip()[-2000:]
-        raise TranscriptionError(f"ffmpeg could not extract audio: {detail}")
 
 
 def _run_ffmpeg_clip(
@@ -266,9 +280,10 @@ def _run_ffmpeg_clip(
     start: float,
     end: float,
 ) -> None:
-    completed = subprocess.run(
+    _run_ffmpeg_checked(
         [
             _ensure_ffmpeg(),
+            "-nostdin",
             "-hide_banner",
             "-loglevel",
             "error",
@@ -287,13 +302,9 @@ def _run_ffmpeg_clip(
             "pcm_s16le",
             str(wav_path),
         ],
-        capture_output=True,
-        text=True,
-        check=False,
+        timeout=FFMPEG_CLIP_TIMEOUT_SECONDS,
+        what="extract retry clip",
     )
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout).strip()[-2000:]
-        raise TranscriptionError(f"ffmpeg could not extract retry clip: {detail}")
 
 
 def _normalize_words(raw_words: object) -> list[dict]:
@@ -594,12 +605,9 @@ def transcribe_with_mlx(
         "decoding_profile": decoding_profile,
     }
     try:
-        completed = subprocess.run(
+        completed = run_captured(
             [str(helper_path)],
             input=json.dumps(request, ensure_ascii=False),
-            capture_output=True,
-            text=True,
-            check=False,
             env=_ffmpeg_subprocess_env(),
             timeout=timeout_seconds,
         )
@@ -902,13 +910,10 @@ def _run_whisperx_alignment(
         ],
     }
     try:
-        completed = subprocess.run(
+        completed = run_captured(
             [str(python_path), "-m", "subflow.whisperx_runner"],
             input=json.dumps(request, ensure_ascii=False),
-            capture_output=True,
-            text=True,
-            check=False,
-            cwd=str(project_root),
+            cwd=project_root,
             env=_ffmpeg_subprocess_env(),
             timeout=timeout_seconds,
         )

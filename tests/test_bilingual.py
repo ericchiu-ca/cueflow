@@ -1,5 +1,8 @@
 import json
+import os
 import subprocess
+import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -8,7 +11,9 @@ from subflow.bilingual import (
     VIDEO_FILTER_SOURCE,
     VIDEO_FILTER_1080P,
     SubtitleBuildError,
+    _VideoGeometry,
     _probe_video_info,
+    burn_ass_into_video,
     adapt_bilingual_ass_for_render,
     ass_escape_text,
     build_bilingual_ass_text,
@@ -177,3 +182,54 @@ class TestVideoProbe(unittest.TestCase):
         self.assertEqual(command[command.index("-select_streams") + 1], "v:0")
         self.assertEqual(duration, 12.5)
         self.assertEqual((geometry.width, geometry.height), (1280, 720))
+
+
+class TestBurnProcessCleanup(unittest.TestCase):
+    def test_failing_progress_callback_kills_ffmpeg_and_removes_partial_output(self):
+        source = parse_srt_text("1\n00:00:01,000 --> 00:00:02,000\nHello\n")
+        chinese = parse_srt_text("1\n00:00:01,000 --> 00:00:02,000\n你好\n")
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value)
+            video = root / "input.mp4"
+            video.write_bytes(b"not really a video")
+            ass = root / "bilingual.ass"
+            ass.write_text(build_bilingual_ass_text(source, chinese), encoding="utf-8")
+            output = root / "out" / "result.mp4"
+            pid_file = root / "ffmpeg.pid"
+            fake_ffmpeg = root / "ffmpeg"
+            fake_ffmpeg.write_text(
+                "#!/bin/sh\n"
+                f"echo $$ > {pid_file}\n"
+                'for last; do :; done\n'
+                'echo partial > "$last"\n'
+                "echo out_time_us=5000000\n"
+                "sleep 30\n",
+                encoding="utf-8",
+            )
+            fake_ffmpeg.chmod(0o755)
+            geometry = _VideoGeometry(1920, 1080)
+
+            def failing_progress(stage, percent, _message):
+                if stage == "encoding" and percent > 3:
+                    raise RuntimeError("progress sink failed")
+
+            with (
+                patch("subflow.bilingual._ensure_fonts"),
+                patch("subflow.bilingual.find_ass_ffmpeg", return_value=fake_ffmpeg),
+                patch("subflow.bilingual._probe_video_info", return_value=(10.0, geometry)),
+                patch("subflow.bilingual._detect_active_picture", return_value=geometry),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "progress sink failed"):
+                    burn_ass_into_video(video, ass, output, progress=failing_progress)
+
+            self.assertFalse(output.exists())
+            pid = int(pid_file.read_text().strip())
+            deadline = time.monotonic() + 3
+            alive = True
+            while alive and time.monotonic() < deadline:
+                try:
+                    os.kill(pid, 0)
+                    time.sleep(0.05)
+                except ProcessLookupError:
+                    alive = False
+            self.assertFalse(alive)
