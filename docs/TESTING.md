@@ -99,6 +99,8 @@ cueflow burn --help
 
 `refactor/followups` 分支（同日）：Python 3.11.15 与 3.12.14 各 84/84 通过；wheel 在独立 venv 中确认字体、schema 与静态页随包安装；`pip install --user` 场景下字体可被找到（旧版本找不到）；`transcribe_vad_cascade` 拆分前后对 7 个语音窗的 en/mixed 黄金用例输出逐字节一致；真实启动 `cueflow web` 验证审校台的后端审计、按时间配对提示与各路由。
 
+`fix/remaining-findings` 分支（同日）：Python 3.11.15 与 3.12.14 各 101/101 通过；新增回归测试均在修复前代码上失败；ASS 渲染布局对未编辑样式的输出与修改前逐字节一致；VAD 级联黄金用例在加入进度上报后仍逐字节一致；真实 FFmpeg 验证烧录回退警告；浏览器验证审校台未保存提示、清理确认文案与轮询网络重试。
+
 仓库中没有 JUnit artifact、coverage artifact 或 release verification record。公开历史从当前快照开始；更早代码状态及其测试结果**无法从本仓库确认**。
 
 ## CI 覆盖范围
