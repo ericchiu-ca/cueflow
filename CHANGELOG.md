@@ -18,6 +18,7 @@
 
 ### Changed
 
+- 审校规则只在后端实现：审校台通过新的只读接口 `POST /api/review/audit` 获取问题和双轨配对状态，不再在页面里复制一份规则。此前两份实现已出现差异（重复文本是否忽略空白、非有限时间是否报错、提示文案）。
 - 字体从 `assets/fonts/` 移到 `subflow/fonts/`，作为 package data 随包安装；`pip install --user` 等非 `sys.prefix` 安装方式不再找不到字体。License 表达式改为 `MIT AND OFL-1.1`，字体许可证与修改说明一并写入 wheel 元数据。
 - 三份 FFmpeg 查找逻辑合并为 `subflow/ffmpeg_tools.py`，探测结果按路径、修改时间和大小缓存。
 - CI matrix 增加 Python 3.12，并在仓库外用独立 venv 安装 wheel 做 smoke test，以发现打包遗漏的资源文件。

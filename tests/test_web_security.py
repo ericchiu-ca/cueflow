@@ -225,6 +225,42 @@ class WebRobustnessTests(unittest.TestCase):
             finally:
                 fixture.close()
 
+    def test_review_audit_endpoint_returns_rules_and_pairing(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            fixture = ServerFixture(Path(temp_value) / "output")
+            try:
+                body = json.dumps(
+                    {
+                        "tracks": {
+                            "source": [
+                                {"id": "0001", "start": 1, "end": 2, "text": "A"},
+                                {"id": "0002", "start": 3, "end": 4, "text": ""},
+                            ],
+                            "chinese": [
+                                {"id": "0001", "start": 1, "end": 2, "text": "甲"},
+                                {"id": "0002", "start": 9, "end": 10, "text": "乙"},
+                            ],
+                        }
+                    }
+                ).encode("utf-8")
+                connection = http.client.HTTPConnection("127.0.0.1", fixture.server.server_address[1], timeout=5)
+                connection.request(
+                    "POST",
+                    "/api/review/audit",
+                    body=body,
+                    headers={"X-CueFlow-CSRF": "test-token", "Content-Type": "application/json"},
+                )
+                response = connection.getresponse()
+                payload = json.loads(response.read())
+                connection.close()
+                self.assertEqual(response.status, 200)
+                self.assertEqual([issue["code"] for issue in payload["tracks"]["source"][1]], ["EMPTY_TEXT"])
+                self.assertEqual(payload["pairing"]["drifted_ids"], ["0002"])
+                # Audit writes nothing, so it must not create project folders.
+                self.assertEqual(list((Path(temp_value) / "output").iterdir()), [])
+            finally:
+                fixture.close()
+
     def test_unexpected_get_error_returns_json_500(self):
         with tempfile.TemporaryDirectory() as temp_value:
             fixture = ServerFixture(Path(temp_value) / "output")

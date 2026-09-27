@@ -1,8 +1,10 @@
 import unittest
+from pathlib import Path
 
 from subflow.core import SubtitleSegment
 from subflow.review import (
     audit_review_segments,
+    audit_review_track,
     review_payload,
     review_summary,
     segments_from_review_payload,
@@ -23,6 +25,33 @@ class TestSubtitleReview(unittest.TestCase):
         self.assertIn("OVERLAP", {issue.code for issue in issues["0002"]})
         self.assertIn("REPEATED_TEXT", {issue.code for issue in issues["0002"]})
         self.assertIn("LONG_TEXT", {issue.code for issue in issues["0003"]})
+
+    def test_editor_audit_is_lenient_and_positional(self):
+        issues = audit_review_track(
+            [
+                {"id": "0001", "start": 0, "end": "", "text": "Hi"},
+                {"id": "0001", "start": 1, "end": 2, "text": "  "},
+                {"id": "0003", "start": 3, "end": 4, "text": "same  words"},
+                {"id": "0004", "start": 5, "end": 6, "text": "Same words"},
+                {"id": "0005", "start": 7, "end": 8, "text": "长" * 46},
+            ],
+            "chinese",
+        )
+        codes = [{issue["code"] for issue in item} for item in issues]
+        self.assertIn("INVALID_TIME", codes[0])  # blank end is NaN, not a crash
+        self.assertIn("EMPTY_TEXT", codes[1])  # duplicate ID keeps its own slot
+        self.assertIn("REPEATED_TEXT", codes[3])  # whitespace-insensitive
+        self.assertIn("LONG_TEXT", codes[4])  # Chinese budget is 45
+        with self.assertRaisesRegex(ValueError, "source or chinese"):
+            audit_review_track([], "other")
+
+    def test_web_ui_does_not_reimplement_review_rules(self):
+        html = (Path(__file__).resolve().parents[1] / "subflow" / "static" / "index.html").read_text(
+            encoding="utf-8"
+        )
+        for code in ("EMPTY_TEXT", "INVALID_TIME", "SHORT_DURATION", "LONG_TEXT", "OVERLAP", "REPEATED_TEXT"):
+            self.assertNotIn(code, html)
+        self.assertIn("/api/review/audit", html)
 
     def test_review_payload_round_trip_preserves_ids_and_edits(self):
         payload = review_payload(self.segments, {"0001": True})

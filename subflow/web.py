@@ -29,7 +29,14 @@ from .bilingual import (
 )
 from . import proc
 from .core import build_srt_text, parse_srt_text, save_master_json, track_pairing
-from .review import review_payload, review_summary, segments_from_review_payload
+from .review import (
+    MAX_CHARS_BY_TRACK,
+    audit_review_track,
+    lenient_segments,
+    review_payload,
+    review_summary,
+    segments_from_review_payload,
+)
 from .transcription import (
     _portable_metadata,
     find_whisperx_python,
@@ -486,7 +493,7 @@ class JobManager:
                 "name": source_name,
                 "expected_ids": [segment.id for segment in source_segments],
                 "output_path": None,
-                "segments": review_payload(source_segments, max_source_chars=90),
+                "segments": review_payload(source_segments, max_source_chars=MAX_CHARS_BY_TRACK["source"]),
             }
         }
         if chinese_text is not None:
@@ -498,7 +505,7 @@ class JobManager:
                 "name": chinese_name or "zh.srt",
                 "expected_ids": [segment.id for segment in chinese_segments],
                 "output_path": None,
-                "segments": review_payload(chinese_segments, max_source_chars=45),
+                "segments": review_payload(chinese_segments, max_source_chars=MAX_CHARS_BY_TRACK["chinese"]),
             }
         session = {
             "project": project,
@@ -566,7 +573,7 @@ class JobManager:
                 payload = review_payload(
                     segments,
                     reviewed,
-                    max_source_chars=45 if track == "chinese" else 90,
+                    max_source_chars=MAX_CHARS_BY_TRACK[track],
                 )
                 prepared.append((track, track_session, segments, payload))
 
@@ -974,6 +981,26 @@ class CueFlowHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/api/cleanup":
                 self._send_json(self.manager.cleanup_local_files(), HTTPStatus.OK)
+                return
+            if parsed.path == "/api/review/audit":
+                # Read-only: the editor calls this after edits so the page never
+                # carries its own copy of the review rules.
+                payload = self._read_json()
+                raw_tracks = payload.get("tracks")
+                if not isinstance(raw_tracks, dict):
+                    raise ValueError("Review audit request must contain subtitle tracks.")
+                result: dict = {
+                    "tracks": {
+                        track: audit_review_track(segments, track)
+                        for track, segments in raw_tracks.items()
+                    }
+                }
+                if raw_tracks.get("source") and raw_tracks.get("chinese"):
+                    result["pairing"] = track_pairing(
+                        lenient_segments(raw_tracks["source"]),
+                        lenient_segments(raw_tracks["chinese"]),
+                    )
+                self._send_json(result)
                 return
             # Everything but cleanup writes under output_root; register it so a
             # concurrent cleanup refuses instead of deleting files mid-write.
