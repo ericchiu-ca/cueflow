@@ -18,6 +18,7 @@
 
 ### Changed
 
+- Web 处理器改为路由表（每个接口一个方法，统一 Host/CSRF 校验与错误处理，POST 路由声明是否写文件）；`transcribe_vad_cascade` 拆分为升级原因、重试语言、候选选择、问题生成和汇总等小函数，行为不变。
 - Codex 翻译按每批 120 条分批进行，附带前后各 3 条只读上下文；每批单独校验、失败重试一次，进度按批次显示。长视频不再依赖单次输出覆盖全部 ID。Codex 登录状态每个任务只检查一次。
 - 审校规则只在后端实现：审校台通过新的只读接口 `POST /api/review/audit` 获取问题和双轨配对状态，不再在页面里复制一份规则。此前两份实现已出现差异（重复文本是否忽略空白、非有限时间是否报错、提示文案）。
 - 字体从 `assets/fonts/` 移到 `subflow/fonts/`，作为 package data 随包安装；`pip install --user` 等非 `sys.prefix` 安装方式不再找不到字体。License 表达式改为 `MIT AND OFL-1.1`，字体许可证与修改说明一并写入 wheel 元数据。
