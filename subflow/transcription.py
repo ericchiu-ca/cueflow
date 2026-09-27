@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 import re
 import subprocess
@@ -271,6 +272,14 @@ def _run_ffmpeg_clip(
     )
 
 
+def _finite(value: object) -> float | None:
+    """A real, finite number from untrusted JSON, else None (bools and NaN excluded)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
 def _normalize_words(raw_words: object) -> list[dict]:
     if not isinstance(raw_words, list):
         return []
@@ -283,9 +292,9 @@ def _normalize_words(raw_words: object) -> list[dict]:
             continue
         normalized: dict = {"word": word}
         for key in ("start", "end", "score", "probability"):
-            value = item.get(key)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                normalized[key] = round(float(value), 3)
+            value = _finite(item.get(key))
+            if value is not None:
+                normalized[key] = round(value, 3)
         words.append(normalized)
     return words
 
@@ -467,22 +476,15 @@ def segments_from_result(
         if not isinstance(item, Mapping):
             continue
         text = str(item.get("text", "")).strip()
-        start = item.get("start")
-        end = item.get("end")
-        if (
-            not text
-            or not isinstance(start, (int, float))
-            or isinstance(start, bool)
-            or not isinstance(end, (int, float))
-            or isinstance(end, bool)
-            or float(end) <= float(start)
-        ):
+        start = _finite(item.get("start"))
+        end = _finite(item.get("end"))
+        if not text or start is None or end is None or end <= start:
             continue
         segments.append(
             SubtitleSegment(
                 id="",
-                start=float(start),
-                end=float(end),
+                start=start,
+                end=end,
                 text=text,
                 words=_normalize_words(item.get("words")),
             )
@@ -502,6 +504,7 @@ def transcribe_with_mlx(
     decoding_profile: str = "standard_fallback_v1",
     enforce_transcript_quality: bool = True,
     timeout_seconds: float = 14400.0,
+    progress: Callable[[int, str], None] | None = None,
 ) -> MlxTranscription:
     if not model_path.is_dir():
         raise TranscriptionError(
@@ -528,6 +531,7 @@ def transcribe_with_mlx(
                 parse_result=segments_from_result,
                 quality_analyzer=_quality_issues_from_result,
                 environment_factory=_ffmpeg_subprocess_env,
+                progress=progress,
             )
             return MlxTranscription(
                 segments=advanced.segments,
@@ -897,9 +901,19 @@ def _run_whisperx_alignment(
     return _preserve_aligned_text(aligned, segments)
 
 
+def _comparable_text(value: str) -> str:
+    return re.sub(r"[\W_]+", "", value.casefold())
+
+
 def _preserve_aligned_text(
     aligned: list[SubtitleSegment], originals: list[SubtitleSegment]
 ) -> list[SubtitleSegment]:
+    """Keep the original wording (spacing, punctuation) on aligned timings.
+
+    Only when a pair is demonstrably the same cue: equal counts alone can hide
+    a sentence split in one place and a dropped segment in another, which
+    would attach every text in between to the wrong timing.
+    """
     if len(aligned) != len(originals):
         return aligned
     return normalize_segments(
@@ -907,7 +921,11 @@ def _preserve_aligned_text(
             id="",
             start=aligned_segment.start,
             end=aligned_segment.end,
-            text=original_segment.text,
+            text=(
+                original_segment.text
+                if _comparable_text(original_segment.text) == _comparable_text(aligned_segment.text)
+                else aligned_segment.text
+            ),
             words=aligned_segment.words,
         )
         for aligned_segment, original_segment in zip(aligned, originals)
@@ -1033,6 +1051,7 @@ def transcribe_media(
             helper_path=helper,
             whisperx_python=whisperx_python,
             enforce_transcript_quality=False,
+            progress=lambda percent, message: update("transcribing", percent, message),
         )
         segments = mlx_result.segments
         quality_issues = mlx_result.quality_issues
@@ -1160,6 +1179,7 @@ def align_existing_project(
     language: str | None = None,
     whisperx_python: str | Path | None = None,
     progress: ProgressCallback | None = None,
+    source_path: str | Path | None = None,
 ) -> TranscriptionResult:
     project = Path(project_path).expanduser().resolve()
     master_path = project / "master.json"
@@ -1177,9 +1197,22 @@ def align_existing_project(
     source_name = metadata.get("source")
     if not isinstance(source_name, str) or not source_name:
         raise TranscriptionError("master.json does not identify the source media")
-    source = (project / source_name).resolve()
-    if source.parent != project:
-        raise TranscriptionError("Source media must remain directly inside the project")
+    if source_path is not None:
+        # CLI projects keep the media wherever it was; master.json stores only
+        # the basename, so insist on it to avoid aligning the wrong file.
+        source = Path(source_path).expanduser().resolve()
+        if source.name != Path(source_name).name:
+            raise TranscriptionError(
+                f"--source must be the original media `{Path(source_name).name}`, got `{source.name}`"
+            )
+    else:
+        source = (project / source_name).resolve()
+        if source.parent != project:
+            raise TranscriptionError("Source media must remain directly inside the project")
+        if not source.is_file():
+            raise TranscriptionError(
+                f"Media file `{source.name}` is not inside the project; pass its location with --source"
+            )
     source = validate_media_path(source)
     segments = load_master_json(master_path)
     if not segments:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import tempfile
@@ -86,6 +87,23 @@ def _offline_env(base: dict[str, str]) -> dict[str, str]:
     return env
 
 
+WORKER_ERROR_DETAIL_CHARS = 2000
+
+
+def _worker_error_detail(stderr: str, stdout: str) -> str:
+    """Prefer the worker's structured error over the library noise before it."""
+    marker = stderr.rfind('{"protocol"')
+    if marker >= 0:
+        try:
+            payload = json.loads(stderr[marker:].strip())
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict) and payload.get("error"):
+            return f"{payload.get('error_type') or 'Error'}: {payload['error']}"[-WORKER_ERROR_DETAIL_CHARS:]
+    detail = stderr.strip() or stdout.strip() or "unknown error"
+    return detail[-WORKER_ERROR_DETAIL_CHARS:]
+
+
 def _run_json_worker(
     python: Path, script: Path, request: dict, environment: dict[str, str]
 ) -> dict:
@@ -96,12 +114,22 @@ def _run_json_worker(
         env=environment,
     )
     if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
-        raise RuntimeError(f"{script.name} exited with {completed.returncode}: {detail}")
+        raise RuntimeError(
+            f"{script.name} exited with {completed.returncode}: "
+            + _worker_error_detail(completed.stderr, completed.stdout)
+        )
     try:
-        return json.loads(completed.stdout)
+        response = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"{script.name} returned invalid JSON") from exc
+    if not isinstance(response, dict):
+        raise RuntimeError(f"{script.name} returned a non-object response")
+    expected = request.get("protocol")
+    if expected and response.get("protocol") != expected:
+        raise RuntimeError(
+            f"{script.name} answered protocol {response.get('protocol')!r}, expected {expected!r}"
+        )
+    return response
 
 
 def _helper_python(helper_path: Path) -> Path:
@@ -138,11 +166,24 @@ def _batch_results(
         {"protocol": MLX_PROTOCOL, "model_path": str(model), "items": items},
         environment,
     )
-    return {str(item.get("id", "")): item for item in response.get("items", [])}
+    items = response.get("items")
+    return {
+        str(item.get("id", "")): item
+        for item in (items if isinstance(items, list) else [])
+        if isinstance(item, dict)
+    }
+
+
+def _finite(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def _float_values(items: list[dict], key: str) -> list[float]:
-    return [float(item[key]) for item in items if isinstance(item.get(key), (int, float))]
+    values = (_finite(item.get(key)) for item in items)
+    return [value for value in values if value is not None]
 
 
 def _metrics(result: dict, duration: float) -> dict:
@@ -153,15 +194,15 @@ def _metrics(result: dict, duration: float) -> dict:
     word_scores: list[float] = []
     speech_duration = 0.0
     for segment in raw_segments:
-        start = segment.get("start")
-        end = segment.get("end")
-        if isinstance(start, (int, float)) and isinstance(end, (int, float)):
-            speech_duration += max(0.0, float(end) - float(start))
+        start = _finite(segment.get("start"))
+        end = _finite(segment.get("end"))
+        if start is not None and end is not None:
+            speech_duration += max(0.0, end - start)
         for word in segment.get("words", []) or []:
             if isinstance(word, dict):
-                value = word.get("probability", word.get("score"))
-                if isinstance(value, (int, float)):
-                    word_scores.append(float(value))
+                value = _finite(word.get("probability", word.get("score")))
+                if value is not None:
+                    word_scores.append(value)
     return {
         "avg_logprob": mean(logprobs) if logprobs else None,
         "max_compression_ratio": max(ratios) if ratios else None,
@@ -385,7 +426,7 @@ def _apply_ownership_boundaries(
 
 def _shift_issue(issue: dict, offset: float, window_index: int) -> dict:
     shifted = dict(issue)
-    for key in ("start", "end", "seek"):
+    for key in ("start", "end"):
         if isinstance(shifted.get(key), (int, float)):
             shifted[key] = round(float(shifted[key]) + offset, 3)
     shifted["window_key"] = f"vad:{window_index}:{shifted.get('window_key', 'quality')}"
@@ -654,13 +695,16 @@ def transcribe_vad_cascade(
     parse_result: Callable,
     quality_analyzer: Callable,
     environment_factory: Callable[[], dict[str, str]],
+    progress: Callable[[int, str], None] | None = None,
 ) -> AdvancedAsrResult:
     """VAD windows -> Turbo -> large-v3 for weak windows -> best candidate each."""
+    report = progress or (lambda _percent, _message: None)
     if language not in {"en", "fr", "mixed"}:
         raise RuntimeError(f"Unsupported advanced ASR language: {language}")
     worker_python = _helper_python(helper_path)
     environment = _offline_env(environment_factory())
     requested_language = {"en": "en", "fr": "fr", "mixed": "auto"}[language]
+    report(34, "正在检测语音活动窗口（VAD）")
     vad = _run_json_worker(
         whisperx_python,
         Path(__file__).with_name("vad_runner.py"),
@@ -688,6 +732,7 @@ def transcribe_vad_cascade(
             {"id": str(window["index"]), "audio_path": str(clip), "language": requested_language}
             for window, clip in zip(windows, clips)
         ]
+        report(40, f"正在用 Turbo 转写 {len(windows)} 个语音窗")
         turbo_output = _batch_results(worker_python, turbo_model, turbo_items, environment)
         turbo_candidates = [
             _candidate(
@@ -721,11 +766,14 @@ def transcribe_vad_cascade(
             for index, languages in retry_languages.items()
             for retry_language in languages
         ]
+        if large_items:
+            report(58, f"正在用 large-v3 复核 {len(retry_languages)} 个低置信度语音窗")
         large_output = (
             _batch_results(worker_python, large_model, large_items, environment)
             if large_items
             else {}
         )
+        report(72, "正在比较候选并合并语音窗")
 
         selected_window_segments: list[list[SubtitleSegment]] = []
         quality_issues: list[dict] = []

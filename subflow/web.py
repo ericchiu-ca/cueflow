@@ -39,6 +39,7 @@ from .review import (
     segments_from_review_payload,
 )
 from .transcription import (
+    SUPPORTED_EXTENSIONS,
     _portable_metadata,
     find_whisperx_python,
     resolve_large_model_path,
@@ -64,6 +65,8 @@ DEFAULT_FRAMELEDGER_MODEL = (
     / "models"
     / "whisper-large-v3-turbo"
 )
+VIDEO_EXTENSIONS = frozenset({".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm"})
+ENCODING_PROFILES = ("hevc-source", "hevc", "h264", "quality", "fast")
 MANAGED_PROJECT_CATEGORIES = frozenset(
     {"transcriptions", "translations", "bilingual", "reviews", "ass-assets", "renders"}
 )
@@ -281,6 +284,11 @@ class JobManager:
     def prepare_transcription_upload(self, filename: str, language: str, alignment: str) -> tuple[dict, Path]:
         identifier = uuid.uuid4().hex
         cleaned = safe_filename(filename)
+        if Path(cleaned).suffix.lower() not in SUPPORTED_EXTENSIONS:
+            raise ValueError(
+                f"Unsupported media type {Path(cleaned).suffix or '(none)'}; use one of "
+                + ", ".join(sorted(SUPPORTED_EXTENSIONS))
+            )
         project = self._project_dir("transcriptions", cleaned, identifier)
         media = project / cleaned
         job = self._create_job(
@@ -398,8 +406,8 @@ class JobManager:
                 message="Preparing stable subtitle IDs",
             )
 
-            def report(percent: int, message: str) -> None:
-                self._update(identifier, percent=percent, message=message)
+            def report(stage: str, percent: int, message: str) -> None:
+                self._update(identifier, stage=stage, percent=percent, message=message)
 
             try:
                 artifacts = run_translation_project(
@@ -702,10 +710,17 @@ class JobManager:
         ass_path = self.ass_path(ass_identifier)
         if ass_path is None:
             raise ValueError("The selected ASS subtitle is no longer available. Upload or generate it again.")
-        if profile not in {"hevc-source", "hevc", "h264", "quality", "fast"}:
-            raise ValueError("Encoding profile must be hevc-source or hevc.")
+        if profile not in ENCODING_PROFILES:
+            raise ValueError("Encoding profile must be one of: " + ", ".join(ENCODING_PROFILES))
         identifier = uuid.uuid4().hex
         cleaned = safe_filename(filename)
+        # Also keeps the upload from colliding with the project's fixed
+        # bilingual.ass / output entries.
+        if Path(cleaned).suffix.lower() not in VIDEO_EXTENSIONS:
+            raise ValueError(
+                f"Unsupported video type {Path(cleaned).suffix or '(none)'}; use one of "
+                + ", ".join(sorted(VIDEO_EXTENSIONS))
+            )
         with self._new_project("renders", cleaned, identifier) as project:
             shutil.copy2(ass_path, project / "bilingual.ass")
         video = project / cleaned
@@ -735,12 +750,14 @@ class JobManager:
                 output_dir = project / "output"
                 output_dir.mkdir(exist_ok=True)
                 output = output_dir / f"{video.stem}.bilingual.mp4"
+                warnings: list[str] = []
                 burn_ass_into_video(
                     video,
                     project / "bilingual.ass",
                     output,
                     profile=profile,
                     progress=report,
+                    warnings=warnings,
                 )
                 self._update(
                     identifier,
@@ -748,6 +765,7 @@ class JobManager:
                     stage="complete",
                     percent=100,
                     message="Bilingual MP4 generated locally",
+                    warnings=warnings,
                     download_url=f"/api/burn/{identifier}/download",
                     download_name=output.name,
                     output_path=str(output),
@@ -853,7 +871,8 @@ class CueFlowHandler(BaseHTTPRequestHandler):
         if length <= 0:
             raise ValueError("The request body is empty.")
         if length > limit:
-            raise ValueError(f"Upload exceeds the configured limit of {limit / 1024**3:.1f} GB.")
+            readable = f"{limit / 1024**3:.1f} GB" if limit >= 1024**3 else f"{limit / 1024**2:.0f} MB"
+            raise ValueError(f"Request body exceeds the configured limit of {readable}.")
         return length
 
     def _receive_file(self, destination: Path) -> None:

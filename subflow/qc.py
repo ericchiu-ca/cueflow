@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Dict, List
 
-from .core import STABLE_ID_RE, SubtitleSegment
+from .core import STABLE_ID_RE, SubtitleSegment, stable_id
 
 
 @dataclass
@@ -35,18 +35,25 @@ def run_qc(
     # Duplicate / malformed ID checks.
     unique_ids = set(ids)
     if len(ids) != len(unique_ids):
-        seen = set()
+        seen: set[str] = set()
+        duplicates: list[str] = []
         for seg_id in ids:
-            if seg_id in seen:
-                issues.append(QCIssue("ERROR", "DUPLICATE_ID", f"Duplicate segment ID in master: {seg_id}"))
-                break
+            if seg_id in seen and seg_id not in duplicates:
+                duplicates.append(seg_id)
             seen.add(seg_id)
+        issues.append(
+            QCIssue(
+                "ERROR",
+                "DUPLICATE_ID",
+                f"Duplicate segment IDs in master ({len(duplicates)}): {', '.join(duplicates[:5])}",
+            )
+        )
 
     invalid_ids = [seg_id for seg_id in ids if not STABLE_ID_RE.fullmatch(seg_id)]
     if invalid_ids:
         issues.append(QCIssue("ERROR", "INVALID_ID", f"Invalid segment IDs: {', '.join(invalid_ids[:5])}"))
 
-    expected_ids = [f"{i:04d}" for i in range(1, len(ids) + 1)]
+    expected_ids = [stable_id(i) for i in range(1, len(ids) + 1)]
     missing_ids = [item for item in expected_ids if item not in unique_ids]
     if missing_ids:
         issues.append(QCIssue("ERROR", "MISSING_ID", f"Missing IDs in master: {', '.join(missing_ids[:5])}"))
@@ -95,7 +102,7 @@ def run_qc(
                     f"Master IDs missing in translation: {', '.join(missing_in_translation[:5])}",
                 )
             )
-        extra_translation_ids = [seg_id for seg_id in translation_ids if seg_id not in unique_ids]
+        extra_translation_ids = sorted(seg_id for seg_id in translation_ids if seg_id not in unique_ids)
         if extra_translation_ids:
             issues.append(
                 QCIssue(
@@ -113,7 +120,8 @@ def run_qc(
                     QCIssue(
                         "WARN",
                         "LONG_CHINESE_SEGMENT",
-                        f"Long Chinese text at {seg_id}: {len(text)} chars",
+                        f"Long Chinese text at {seg_id}: {_chinese_char_length(text)} chars "
+                        f"(limit {max_chinese_chars})",
                     )
                 )
 

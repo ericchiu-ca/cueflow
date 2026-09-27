@@ -83,10 +83,10 @@ def cmd_prepare(args: argparse.Namespace) -> int:
 
     print(f"Prepared project at: {project}")
     print("Generated:")
-    print(f"- master.json")
-    print(f"- en.srt")
-    print(f"- translation_input.txt")
-    print(f"- source.m4a (only for ASR fallback)")
+    print("- master.json")
+    print("- en.srt")
+    print("- translation_input.txt")
+    print("- source.m4a (only for ASR fallback)")
     return 0
 
 
@@ -183,6 +183,7 @@ def cmd_align_project(args: argparse.Namespace) -> int:
         language=args.language,
         whisperx_python=args.whisperx_python,
         progress=lambda _stage, percent, message: print(f"[{percent:3d}%] {message}"),
+        source_path=args.source,
     )
     print(f"Generated aligned SRT: {result.srt_path}")
     print(f"Aligned master data: {result.master_path}")
@@ -201,7 +202,7 @@ def cmd_translate_srt(args: argparse.Namespace) -> int:
         model=args.model,
         provider_name=args.provider,
         source_filename=source.name,
-        progress=lambda percent, message: print(f"[{percent:3d}%] {message}"),
+        progress=lambda _stage, percent, message: print(f"[{percent:3d}%] {message}"),
     )
     print(f"Generated Chinese SRT: {artifacts.zh_srt_path}")
     print(f"Stable-ID translation: {artifacts.translation_text_path}")
@@ -326,8 +327,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     align.add_argument("project", help="Existing Subflow project directory")
     align.add_argument(
+        "--source",
+        help="Original media file when it is not inside the project (e.g. after transcribe-file)",
+    )
+    align.add_argument(
         "--language",
-        choices=("en", "fr-CA"),
+        choices=("en", "fr-CA", "mixed"),
         help="Override the language stored in master.json",
     )
     align.add_argument(

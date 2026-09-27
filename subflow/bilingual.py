@@ -80,8 +80,25 @@ class _VideoGeometry:
         return self.active_height if self.active_height is not None else self.height
 
 
+def _centiseconds(seconds: float) -> int:
+    # Go through whole milliseconds and round half up, so 1.005 s is 1.01 and
+    # not 1.00 from binary float error in round(x * 100).
+    milliseconds = max(0, int(round(float(seconds) * 1000)))
+    return (milliseconds + 5) // 10
+
+
+def _ass_timing(start: float, end: float) -> str:
+    """ASS only has centiseconds; keep sub-10 ms cues at least 1 cs long."""
+    start_cs = _centiseconds(start)
+    end_cs = max(_centiseconds(end), start_cs + 1)
+    return f"{_ass_time_cs(start_cs)},{_ass_time_cs(end_cs)}"
+
+
 def _ass_time(seconds: float) -> str:
-    total_cs = max(0, int(round(float(seconds) * 100)))
+    return _ass_time_cs(_centiseconds(seconds))
+
+
+def _ass_time_cs(total_cs: int) -> str:
     hours, remainder = divmod(total_cs, 360000)
     minutes, remainder = divmod(remainder, 6000)
     whole_seconds, centiseconds = divmod(remainder, 100)
@@ -187,7 +204,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     events: list[str] = []
     for source_segment, chinese_segment in zip(source, chinese):
-        timing = f"{_ass_time(source_segment.start)},{_ass_time(source_segment.end)}"
+        timing = _ass_timing(source_segment.start, source_segment.end)
         events.append(
             "Dialogue: 1,"
             f"{timing},Chinese,,0,0,0,,{ass_escape_text(chinese_segment.text)}"
@@ -300,6 +317,31 @@ def _wrap_ass_cjk_text(value: str, max_columns: int) -> str:
     return r"\N".join(rendered_lines)
 
 
+ASS_STYLE_FIELDS = (
+    "Name", "Fontname", "Fontsize", "PrimaryColour", "SecondaryColour", "OutlineColour",
+    "BackColour", "Bold", "Italic", "Underline", "StrikeOut", "ScaleX", "ScaleY", "Spacing",
+    "Angle", "BorderStyle", "Outline", "Shadow", "Alignment", "MarginL", "MarginR", "MarginV",
+    "Encoding",
+)
+
+
+def _ass_style(lines: list[str], name: str) -> dict[str, str] | None:
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("Style:"):
+            continue
+        values = [value.strip() for value in stripped[len("Style:"):].split(",")]
+        if len(values) == len(ASS_STYLE_FIELDS) and values[0] == name:
+            return dict(zip(ASS_STYLE_FIELDS, values))
+    return None
+
+
+def _ass_override_colour(style_colour: str, default: str) -> str:
+    """Style colours are &HAABBGGRR; inline \\1c/\\3c overrides want &HBBGGRR&."""
+    match = re.fullmatch(r"&H([0-9A-Fa-f]{2})?([0-9A-Fa-f]{6})&?", style_colour.strip())
+    return f"&H{match.group(2).upper()}&" if match else default
+
+
 def adapt_bilingual_ass_for_render(
     ass_text: str,
     *,
@@ -309,6 +351,7 @@ def adapt_bilingual_ass_for_render(
     active_y: int = 0,
     active_width: int | None = None,
     active_height: int | None = None,
+    warnings: list[str] | None = None,
 ) -> str:
     """Create a target-aware render copy without changing the downloadable ASS.
 
@@ -347,10 +390,19 @@ def adapt_bilingual_ass_for_render(
 
     if not grouped:
         return ass_text
-    if any(
-        not tracks["Chinese"] or len(tracks["Chinese"]) != len(tracks["Source"])
-        for tracks in grouped.values()
-    ):
+    unpaired = [
+        key
+        for key, tracks in grouped.items()
+        if not tracks["Chinese"] or len(tracks["Chinese"]) != len(tracks["Source"])
+    ]
+    if unpaired:
+        if warnings is not None:
+            start, end = sorted(unpaired)[0]
+            warnings.append(
+                f"{len(unpaired)} subtitle time slot(s) no longer have one Chinese and one "
+                f"source event (first at {start}-{end}); burned the ASS as-is without the "
+                "frame-aware stacked layout, so the two tracks may overlap."
+            )
         return ass_text
 
     play_res_x = max(2, _round_positive(ASS_PLAY_RES_Y * frame_width / frame_height))
@@ -373,10 +425,18 @@ def adapt_bilingual_ass_for_render(
         ),
     )
 
+    # Honour Chinese/Source style edits made in the downloadable ASS (e.g. in
+    # Aegisub); fall back to CueFlow's defaults for anything missing.
+    chinese_style = _ass_style(lines, "Chinese") or {}
+    source_style = _ass_style(lines, "Source") or {}
     source_transition = (
         rf"\N{{\fs{ASS_LANGUAGE_GAP}\bord0\shad0\alpha&HFF&}}\h"
-        rf"\N{{\alpha&H00&\fn{SOURCE_FONT_NAME}\fs{SOURCE_FONT_SIZE}"
-        rf"\1c&HF0F0F0&\3c&H000000&\bord{SOURCE_OUTLINE}\shad0}}"
+        rf"\N{{\alpha&H00&\fn{source_style.get('Fontname', SOURCE_FONT_NAME)}"
+        rf"\fs{source_style.get('Fontsize', SOURCE_FONT_SIZE)}"
+        rf"\1c{_ass_override_colour(source_style.get('PrimaryColour', ''), '&HF0F0F0&')}"
+        rf"\3c{_ass_override_colour(source_style.get('OutlineColour', ''), '&H000000&')}"
+        rf"\bord{source_style.get('Outline', SOURCE_OUTLINE)}"
+        rf"\shad{source_style.get('Shadow', 0)}}}"
     )
     replacements: dict[int, str] = {}
     skipped: set[int] = set()
@@ -403,9 +463,14 @@ def adapt_bilingual_ass_for_render(
             rebuilt.append(line)
 
     bilingual_style = (
-        f"Style: Bilingual,{CHINESE_FONT_NAME},{CHINESE_FONT_SIZE},"
-        "&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,"
-        f"0,0,0,0,100,100,0,0,1,{CHINESE_OUTLINE},0,2,"
+        f"Style: Bilingual,{chinese_style.get('Fontname', CHINESE_FONT_NAME)},"
+        f"{chinese_style.get('Fontsize', CHINESE_FONT_SIZE)},"
+        f"{chinese_style.get('PrimaryColour', '&H00FFFFFF')},"
+        f"{chinese_style.get('SecondaryColour', '&H00FFFFFF')},"
+        f"{chinese_style.get('OutlineColour', '&H00000000')},"
+        f"{chinese_style.get('BackColour', '&H00000000')},"
+        f"0,0,0,0,100,100,0,0,1,{chinese_style.get('Outline', CHINESE_OUTLINE)},"
+        f"{chinese_style.get('Shadow', 0)},2,"
         f"{margin_left},{margin_right},{margin_bottom},1"
     )
     adapted: list[str] = []
@@ -663,29 +728,33 @@ def render_bilingual_preview(
             f"crop={ASS_PLAY_RES_X}:{ASS_PREVIEW_CROP_HEIGHT}:0:{ASS_PREVIEW_CROP_Y},"
             f"scale={ASS_PREVIEW_WIDTH}:{ASS_PREVIEW_HEIGHT}"
         )
-        completed = subprocess.run(
-            [
-                str(ffmpeg),
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                f"color=c=0x10252a:s={ASS_PLAY_RES_X}x{ASS_PLAY_RES_Y}:d=1",
-                "-vf",
-                preview_filter,
-                "-frames:v",
-                "1",
-                str(output),
-            ],
-            cwd=temp,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=60,
-        )
+        try:
+            completed = subprocess.run(
+                [
+                    str(ffmpeg),
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    f"color=c=0x10252a:s={ASS_PLAY_RES_X}x{ASS_PLAY_RES_Y}:d=1",
+                    "-vf",
+                    preview_filter,
+                    "-frames:v",
+                    "1",
+                    str(output),
+                ],
+                cwd=temp,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            output.unlink(missing_ok=True)
+            raise VideoBurnError(f"FFmpeg could not render the ASS preview: {error}") from error
     if completed.returncode != 0:
         output.unlink(missing_ok=True)
         detail = (completed.stderr or completed.stdout).strip()
@@ -724,6 +793,7 @@ def burn_ass_into_video(
     ffmpeg_path: str | Path | None = None,
     fonts_dir: str | Path = DEFAULT_FONTS_DIR,
     progress: ProgressCallback | None = None,
+    warnings: list[str] | None = None,
 ) -> Path:
     video = Path(video_path).expanduser().absolute()
     ass = Path(ass_path).expanduser().absolute()
@@ -761,8 +831,10 @@ def burn_ass_into_video(
                 ass_text = ass.read_text(encoding="utf-16")
             except UnicodeError as error:
                 raise VideoBurnError("ASS subtitle must be encoded as UTF-8 or UTF-16.") from error
+        layout_warnings: list[str] = []
         render_ass = adapt_bilingual_ass_for_render(
             ass_text,
+            warnings=layout_warnings,
             frame_width=render_geometry.width,
             frame_height=render_geometry.height,
             active_x=render_geometry.active_x,
@@ -770,6 +842,10 @@ def burn_ass_into_video(
             active_width=render_geometry.content_width,
             active_height=render_geometry.content_height,
         )
+        for warning in layout_warnings:
+            report("encoding", 3, warning)
+        if warnings is not None:
+            warnings.extend(layout_warnings)
         (temp / "subtitle.ass").write_text(render_ass, encoding="utf-8")
         (temp / "fonts").symlink_to(fonts, target_is_directory=True)
         command = [

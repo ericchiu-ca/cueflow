@@ -1,4 +1,5 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -55,7 +56,7 @@ class RecordingProvider(TranslationProvider):
     def translate(self, request, output_path, progress=None):
         self.requests.append(request)
         if progress:
-            progress(50, "working")
+            progress("translation", 50, "working")
         items = [{"id": s.id, "text": f"译{s.id}"} for s in request.segments]
         if len(self.requests) in self.broken_attempts:
             items = items[:-1]  # drop one ID, as a truncated response would
@@ -143,7 +144,7 @@ class TranslationTests(unittest.TestCase):
                 source_language="en",
                 provider_instance=provider,
                 batch_size=120,
-                progress=lambda percent, message: messages.append((percent, message)),
+                progress=lambda _stage, percent, message: messages.append((percent, message)),
             )
             result = json.loads(artifacts.result_json_path.read_text(encoding="utf-8"))
             translated = parse_srt_text(artifacts.zh_srt_path.read_text(encoding="utf-8"))
@@ -214,6 +215,28 @@ class TranslationTests(unittest.TestCase):
                 with self.assertRaisesRegex(TranslationError, "without writing"):
                     provider.translate(request, output_path)
             self.assertFalse(output_path.exists())
+
+    def test_codex_login_status_is_matched_loosely_but_requires_chatgpt(self):
+        from subflow.translation import codex_environment_status
+
+        cases = [
+            (0, "Logged in using ChatGPT", True),
+            (0, "Signed in with ChatGPT (plus plan)", True),
+            (0, "logged in using chatgpt\n", True),
+            (0, "Logged in using an API key - sk-...", False),
+            (1, "Not logged in", False),
+            (0, "Not logged in to ChatGPT", False),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            fake_codex = Path(directory) / "codex"
+            fake_codex.write_text("#!/bin/sh\n", encoding="utf-8")
+            fake_codex.chmod(0o755)
+            for code, message, expected in cases:
+                completed = subprocess.CompletedProcess([], code, stdout=message, stderr="")
+                with self.subTest(message=message), patch(
+                    "subflow.translation.subprocess.run", return_value=completed
+                ):
+                    self.assertEqual(codex_environment_status(str(fake_codex))["ready"], expected)
 
     def test_codex_prompt_contains_exact_disclosed_fields(self):
         segments = tuple(parse_srt_text(SOURCE_SRT))

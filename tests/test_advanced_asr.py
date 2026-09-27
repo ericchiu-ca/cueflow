@@ -246,6 +246,7 @@ class TestAdvancedAsr(unittest.TestCase):
                 ]
             return []
 
+        reports = []
         with tempfile.TemporaryDirectory() as directory:
             with (
                 patch("subflow.advanced_asr._helper_python", return_value=Path("/fake/python")),
@@ -280,8 +281,10 @@ class TestAdvancedAsr(unittest.TestCase):
                     parse_result=segments_from_result,
                     quality_analyzer=quality,
                     environment_factory=dict,
+                    progress=lambda percent, message: reports.append((percent, message)),
                 )
 
+        self.assertEqual([percent for percent, _ in reports], [34, 40, 58, 72])
         self.assertEqual(batches.call_count, 2)
         self.assertEqual(result.large_v3_window_count, 1)
         self.assertEqual(result.large_v3_selected_count, 1)
@@ -325,6 +328,52 @@ class TestAdvancedAsr(unittest.TestCase):
                         quality_analyzer=lambda _result: [],
                         environment_factory=dict,
                     )
+
+    def test_metrics_ignore_non_finite_values(self):
+        from subflow.advanced_asr import _metrics
+
+        metrics = _metrics(
+            {
+                "segments": [
+                    {"start": 0.0, "end": float("nan"), "avg_logprob": float("nan"), "words": [{"probability": float("nan")}]},
+                    {"start": 0.0, "end": 1.0, "avg_logprob": -0.2, "words": [{"probability": 0.9}]},
+                ]
+            },
+            2.0,
+        )
+        for value in metrics.values():
+            if isinstance(value, float):
+                self.assertTrue(value == value, metrics)  # no NaN leaks into scoring
+        self.assertEqual(metrics["avg_logprob"], -0.2)
+
+    def test_worker_errors_are_structured_truncated_and_protocol_checked(self):
+        import sys
+
+        from subflow.advanced_asr import _run_json_worker
+
+        with tempfile.TemporaryDirectory() as directory:
+            failing = Path(directory) / "failing_worker.py"
+            failing.write_text(
+                "import json, sys\n"
+                "sys.stderr.write('torch warning\\n' * 5000)\n"
+                "json.dump({'protocol': 'p1', 'error_type': 'ValueError', 'error': 'bad weights'}, sys.stderr)\n"
+                "sys.exit(2)\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError) as caught:
+                _run_json_worker(Path(sys.executable), failing, {"protocol": "p1"}, {})
+            self.assertTrue(str(caught.exception).endswith("ValueError: bad weights"))
+            self.assertNotIn("torch warning", str(caught.exception))
+
+            wrong = Path(directory) / "wrong_worker.py"
+            wrong.write_text("import json, sys\njson.dump({'protocol': 'other'}, sys.stdout)\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "expected 'p1'"):
+                _run_json_worker(Path(sys.executable), wrong, {"protocol": "p1"}, {})
+
+            listing = Path(directory) / "list_worker.py"
+            listing.write_text("import json, sys\njson.dump([1, 2], sys.stdout)\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "non-object"):
+                _run_json_worker(Path(sys.executable), listing, {"protocol": "p1"}, {})
 
     def test_whisperx_chunk_dicts_are_converted_to_spans(self):
         self.assertEqual(

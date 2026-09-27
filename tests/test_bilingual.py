@@ -85,6 +85,49 @@ Public transit shaped the city.
         shifted = track((1, 2, "一"), (3, 4, "二"), (5, 6, "三"), (7, 8, "四"))
         self.assertIn("二", build_bilingual_ass_text(source, shifted))
 
+    def test_ass_timing_rounds_half_up_and_keeps_tiny_cues_visible(self):
+        source = parse_srt_text(
+            "1\n00:00:01,005 --> 00:00:01,015\nA\n\n2\n00:00:03,001 --> 00:00:03,004\nB\n"
+        )
+        chinese = parse_srt_text(
+            "1\n00:00:01,005 --> 00:00:01,015\n甲\n\n2\n00:00:03,001 --> 00:00:03,004\n乙\n"
+        )
+        output = build_bilingual_ass_text(source, chinese)
+        self.assertIn("0:00:01.01,0:00:01.02,Chinese", output)
+        self.assertIn("0:00:03.00,0:00:03.01,Chinese", output)
+
+    def test_preview_timeout_is_reported_as_video_burn_error(self):
+        from subflow.bilingual import VideoBurnError, render_bilingual_preview
+
+        with tempfile.TemporaryDirectory() as temp_value, (
+            patch("subflow.bilingual._ensure_fonts")
+        ), patch("subflow.bilingual.find_ass_ffmpeg", return_value=Path("ffmpeg")), patch(
+            "subflow.bilingual.subprocess.run", side_effect=subprocess.TimeoutExpired(["ffmpeg"], 60)
+        ):
+            fonts = Path(temp_value) / "fonts"
+            fonts.mkdir()
+            with self.assertRaisesRegex(VideoBurnError, "could not render the ASS preview"):
+                render_bilingual_preview(Path(temp_value) / "p.png", fonts_dir=fonts)
+
+    def test_render_layout_honours_edited_styles(self):
+        editable = build_bilingual_ass_text(self.source, self.chinese)
+        edited = editable.replace(
+            "Style: Source,Mulish SemiBold,64,&H00F0F0F0",
+            "Style: Source,Inter Medium,58,&H0000FFFF",
+        ).replace("Style: Chinese,CueFlow Han Sans SC,94,", "Style: Chinese,CueFlow Han Sans SC,88,")
+        output = adapt_bilingual_ass_for_render(edited, frame_width=1920, frame_height=1080)
+        self.assertIn(r"\fnInter Medium\fs58\1c&H00FFFF&", output)
+        self.assertIn("Style: Bilingual,CueFlow Han Sans SC,88,", output)
+
+    def test_render_layout_fallback_is_reported(self):
+        editable = build_bilingual_ass_text(self.source, self.chinese)
+        retimed = editable.replace("Dialogue: 1,0:00:01.00,0:00:03.50,Chinese", "Dialogue: 1,0:00:01.10,0:00:03.50,Chinese")
+        warnings = []
+        output = adapt_bilingual_ass_for_render(retimed, frame_width=1920, frame_height=1080, warnings=warnings)
+        self.assertEqual(output, retimed)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("0:00:01.00-0:00:03.50", warnings[0])
+
     def test_ass_escapes_override_characters_and_line_breaks(self):
         self.assertEqual(
             ass_escape_text("Use {x}\\path\nnext"),

@@ -55,6 +55,17 @@ But the labor market remains surprisingly strong.
             path.write_bytes(sample.encode("utf-8"))
             self.assertEqual(len(parse_srt_file(path)), 2)
 
+    def test_parse_srt_accepts_cue_settings_and_names_bad_blocks(self):
+        segments = parse_srt_text(
+            "1\n00:00:01,000 --> 00:00:02,000 X1:10 X2:20 Y1:5 Y2:9\nPositioned\n\n"
+            "2\n00:00:03,000-->00:00:04,000\nTight arrow\n"
+        )
+        self.assertEqual([(s.start, s.end, s.text) for s in segments], [(1.0, 2.0, "Positioned"), (3.0, 4.0, "Tight arrow")])
+        with self.assertRaisesRegex(ValueError, "block 2"):
+            parse_srt_text("1\n00:00:01,000 --> 00:00:02,000\nA\n\n2\n00:00:03,000 --> 00:00:04,000 --> 00:00:05,000\nB\n")
+        with self.assertRaisesRegex(ValueError, "block 1"):
+            parse_srt_text("1\n00:00:01,000 --> 4\nA\n")
+
     def test_parse_srt_preserves_millisecond_timing_round_trip(self):
         sample = "1\n00:00:01,234 --> 00:00:02,567\nPrecise\n\n2\n00:00:03,001 --> 00:00:03,004\nShort\n"
         segments = parse_srt_text(sample)
@@ -114,6 +125,17 @@ class TestQCMetrics(unittest.TestCase):
         self.assertIn("EMPTY_TRANSLATION", codes)
         self.assertIn("LONG_CHINESE_SEGMENT", codes)
 
+
+    def test_qc_reports_every_duplicate_and_counted_length(self):
+        segments = [
+            SubtitleSegment(seg_id, index * 2.0, index * 2.0 + 1.5, "line", [])
+            for index, seg_id in enumerate(["0001", "0001", "0002", "0002", "0003"])
+        ]
+        issues = run_qc(segments, translations={"0001": "中 文 " * 20}, max_chinese_chars=10)
+        duplicate = next(issue for issue in issues if issue.code == "DUPLICATE_ID")
+        self.assertIn("(2): 0001, 0002", duplicate.message)
+        long_text = next(issue for issue in issues if issue.code == "LONG_CHINESE_SEGMENT")
+        self.assertIn("40 chars (limit 10)", long_text.message)
 
     def test_qc_accepts_ids_beyond_9999_segments(self):
         segments = [
@@ -182,6 +204,45 @@ class TestLocalTranscription(unittest.TestCase):
         self.assertEqual(segments[0].start, 1.234)
         self.assertEqual(segments[0].text, "Bonjour Montreal.")
         self.assertEqual(segments[0].words[0]["probability"], 0.98)
+
+    def test_aligned_text_is_restored_only_for_matching_cues(self):
+        from subflow.transcription import _preserve_aligned_text
+
+        originals = [
+            SubtitleSegment("0001", 0.0, 1.0, "Hello,  world!", []),
+            SubtitleSegment("0002", 1.0, 2.0, "Second line.", []),
+            SubtitleSegment("0003", 2.0, 3.0, "Third line.", []),
+        ]
+        # Same count, but WhisperX split the first cue and dropped the second.
+        aligned = [
+            SubtitleSegment("", 0.0, 0.5, "hello world", []),
+            SubtitleSegment("", 0.5, 1.0, "extra split", []),
+            SubtitleSegment("", 2.0, 3.0, "third line", []),
+        ]
+        restored = _preserve_aligned_text(aligned, originals)
+        self.assertEqual(
+            [s.text for s in restored], ["Hello,  world!", "extra split", "Third line."]
+        )
+
+    def test_non_finite_timings_are_dropped(self):
+        nan, inf = float("nan"), float("inf")
+        segments = segments_from_result(
+            {
+                "segments": [
+                    {"start": nan, "end": 2.0, "text": "nan start"},
+                    {"start": 1.0, "end": inf, "text": "inf end"},
+                    {
+                        "start": 3.0,
+                        "end": 4.0,
+                        "text": "kept",
+                        "words": [{"word": "kept", "start": nan, "end": 4.0, "probability": 0.9}],
+                    },
+                ]
+            },
+            enforce_transcript_quality=False,
+        )
+        self.assertEqual([s.text for s in segments], ["kept"])
+        self.assertEqual(segments[0].words, [{"word": "kept", "end": 4.0, "probability": 0.9}])
 
     def test_mlx_quality_gate_rejects_repetition_and_high_compression(self):
         repeated = {
@@ -384,6 +445,32 @@ class TestLocalTranscription(unittest.TestCase):
             self.assertEqual(metadata["alignment"], "whisperx-mixed")
             self.assertEqual(metadata["confidence_windows"][1]["segment_ids"], ["0002", "0003"])
             self.assertEqual(metadata["quality_issues"][0]["segment_ids"], ["0002", "0003"])
+
+    def test_realign_accepts_media_outside_the_project_via_source(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value)
+            project = root / "project"
+            project.mkdir()
+            media = root / "videos" / "talk.mp4"
+            media.parent.mkdir()
+            media.write_bytes(b"source")
+            segments = [SubtitleSegment("0001", 0.0, 1.0, "Hello", [])]
+            save_master_json(project / "master.json", segments, metadata={"source": "talk.mp4", "language": "en"})
+            with self.assertRaisesRegex(TranscriptionError, "--source"):
+                align_existing_project(project)
+            other = root / "videos" / "other.mp4"
+            other.write_bytes(b"x")
+            with self.assertRaisesRegex(TranscriptionError, "talk.mp4"):
+                align_existing_project(project, source_path=other)
+            with (
+                patch("subflow.transcription._run_ffmpeg") as ffmpeg,
+                patch("subflow.transcription._run_whisperx_alignment", return_value=segments),
+                patch("subflow.transcription.find_whisperx_python", return_value=Path("/mock/python")),
+                patch("subflow.transcription.whisperx_version", return_value="3.8.6"),
+            ):
+                artifact = align_existing_project(project, source_path=media)
+            self.assertEqual(ffmpeg.call_args.args[0], media.resolve())
+            self.assertTrue(artifact.srt_path.is_file())
 
     def test_mixed_language_realign_without_windows_fails_clearly(self):
         with tempfile.TemporaryDirectory() as temp_value:
