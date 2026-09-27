@@ -116,7 +116,15 @@ def codex_environment_status(configured_path: str | None = None) -> dict[str, An
     message = "\n".join(
         part.strip() for part in (result.stdout, result.stderr) if part.strip()
     )
-    ready = result.returncode == 0 and "Logged in using ChatGPT" in message
+    # Match loosely: Codex CLI rewords this line between releases. A ChatGPT
+    # login is still required (an API-key login is reported as not ready).
+    lowered = message.casefold()
+    ready = (
+        result.returncode == 0
+        and "chatgpt" in lowered
+        and "not logged in" not in lowered
+        and "logged out" not in lowered
+    )
     return {
         "ready": ready,
         "path": codex_path,

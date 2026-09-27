@@ -80,8 +80,25 @@ class _VideoGeometry:
         return self.active_height if self.active_height is not None else self.height
 
 
+def _centiseconds(seconds: float) -> int:
+    # Go through whole milliseconds and round half up, so 1.005 s is 1.01 and
+    # not 1.00 from binary float error in round(x * 100).
+    milliseconds = max(0, int(round(float(seconds) * 1000)))
+    return (milliseconds + 5) // 10
+
+
+def _ass_timing(start: float, end: float) -> str:
+    """ASS only has centiseconds; keep sub-10 ms cues at least 1 cs long."""
+    start_cs = _centiseconds(start)
+    end_cs = max(_centiseconds(end), start_cs + 1)
+    return f"{_ass_time_cs(start_cs)},{_ass_time_cs(end_cs)}"
+
+
 def _ass_time(seconds: float) -> str:
-    total_cs = max(0, int(round(float(seconds) * 100)))
+    return _ass_time_cs(_centiseconds(seconds))
+
+
+def _ass_time_cs(total_cs: int) -> str:
     hours, remainder = divmod(total_cs, 360000)
     minutes, remainder = divmod(remainder, 6000)
     whole_seconds, centiseconds = divmod(remainder, 100)
@@ -187,7 +204,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     events: list[str] = []
     for source_segment, chinese_segment in zip(source, chinese):
-        timing = f"{_ass_time(source_segment.start)},{_ass_time(source_segment.end)}"
+        timing = _ass_timing(source_segment.start, source_segment.end)
         events.append(
             "Dialogue: 1,"
             f"{timing},Chinese,,0,0,0,,{ass_escape_text(chinese_segment.text)}"
@@ -663,29 +680,33 @@ def render_bilingual_preview(
             f"crop={ASS_PLAY_RES_X}:{ASS_PREVIEW_CROP_HEIGHT}:0:{ASS_PREVIEW_CROP_Y},"
             f"scale={ASS_PREVIEW_WIDTH}:{ASS_PREVIEW_HEIGHT}"
         )
-        completed = subprocess.run(
-            [
-                str(ffmpeg),
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                f"color=c=0x10252a:s={ASS_PLAY_RES_X}x{ASS_PLAY_RES_Y}:d=1",
-                "-vf",
-                preview_filter,
-                "-frames:v",
-                "1",
-                str(output),
-            ],
-            cwd=temp,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=60,
-        )
+        try:
+            completed = subprocess.run(
+                [
+                    str(ffmpeg),
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    f"color=c=0x10252a:s={ASS_PLAY_RES_X}x{ASS_PLAY_RES_Y}:d=1",
+                    "-vf",
+                    preview_filter,
+                    "-frames:v",
+                    "1",
+                    str(output),
+                ],
+                cwd=temp,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            output.unlink(missing_ok=True)
+            raise VideoBurnError(f"FFmpeg could not render the ASS preview: {error}") from error
     if completed.returncode != 0:
         output.unlink(missing_ok=True)
         detail = (completed.stderr or completed.stdout).strip()

@@ -208,6 +208,23 @@ class WebRobustnessTests(unittest.TestCase):
             finally:
                 fixture.close()
 
+    def test_oversized_json_body_reports_megabytes(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            fixture = ServerFixture(Path(temp_value) / "output")
+            try:
+                connection = http.client.HTTPConnection("127.0.0.1", fixture.server.server_address[1], timeout=5)
+                connection.putrequest("POST", "/api/review")
+                connection.putheader("X-CueFlow-CSRF", "test-token")
+                connection.putheader("Content-Length", str(30 * 1024 * 1024))
+                connection.endheaders()
+                response = connection.getresponse()
+                payload = json.loads(response.read())
+                connection.close()
+                self.assertEqual(response.status, 400)
+                self.assertIn("24 MB", payload["error"])
+            finally:
+                fixture.close()
+
     def test_responses_forbid_framing(self):
         with tempfile.TemporaryDirectory() as temp_value:
             fixture = ServerFixture(Path(temp_value) / "output")
@@ -383,6 +400,30 @@ class WebRobustnessTests(unittest.TestCase):
                 self.assertEqual(len(failed), 1)  # the transcription job is still reported
             finally:
                 fixture.close()
+
+    def test_uploads_with_colliding_or_unsupported_names_are_rejected_early(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value) / "output"
+            manager = make_manager(root)
+            try:
+                ass = root / "ass-assets" / "x" / "bilingual.ass"
+                ass.parent.mkdir(parents=True)
+                ass.write_text("[Script Info]\n", encoding="utf-8")
+                manager.ass_assets["ass1"] = ass
+                for name in ("bilingual.ass", "output", "notes.txt"):
+                    with self.assertRaisesRegex(ValueError, "Unsupported video type"):
+                        manager.prepare_burn_upload(name, "ass1", "hevc-source")
+                with self.assertRaisesRegex(ValueError, "h264"):
+                    manager.prepare_burn_upload("clip.mp4", "ass1", "av1")
+                with self.assertRaisesRegex(ValueError, "Unsupported media type"):
+                    manager.prepare_transcription_upload("notes.txt", "en", "auto")
+                self.assertFalse((root / "renders").exists())
+                self.assertFalse((root / "transcriptions").exists())
+                job, video = manager.prepare_burn_upload("clip.MOV", "ass1", "hevc-source")
+                self.assertEqual(video.name, "clip.MOV")
+                self.assertTrue((video.parent / "bilingual.ass").is_file())
+            finally:
+                manager.executor.shutdown(wait=True, cancel_futures=True)
 
     def test_discard_project_only_removes_managed_project_directories(self):
         with tempfile.TemporaryDirectory() as temp_value:
