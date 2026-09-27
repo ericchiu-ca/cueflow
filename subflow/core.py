@@ -46,8 +46,8 @@ def normalize_segments(segments: Iterable[SubtitleSegment]) -> List[SubtitleSegm
     return [
         SubtitleSegment(
             id=stable_id(i),
-            start=round(float(seg.start), 2),
-            end=round(float(seg.end), 2),
+            start=round(float(seg.start), 3),
+            end=round(float(seg.end), 3),
             text=(seg.text or "").strip(),
             words=list(seg.words),
         )
@@ -56,7 +56,7 @@ def normalize_segments(segments: Iterable[SubtitleSegment]) -> List[SubtitleSegm
 
 
 def parse_srt_text(raw: str) -> List[SubtitleSegment]:
-    normalized = raw.replace("\r\n", "\n").replace("\r", "\n").strip()
+    normalized = raw.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n").strip()
     if not normalized:
         return []
 
@@ -80,8 +80,8 @@ def parse_srt_text(raw: str) -> List[SubtitleSegment]:
         if "-->" not in time_line:
             continue
         start_raw, end_raw = [x.strip() for x in time_line.split("-->")]
-        start = _to_seconds(start_raw)
-        end = _to_seconds(end_raw)
+        start = round(_to_seconds(start_raw), 3)
+        end = round(_to_seconds(end_raw), 3)
         if end <= start:
             continue
 
@@ -89,13 +89,13 @@ def parse_srt_text(raw: str) -> List[SubtitleSegment]:
         if not text:
             continue
 
-        parsed.append(SubtitleSegment(id="", start=round(start, 2), end=round(end, 2), text=text, words=[]))
+        parsed.append(SubtitleSegment(id="", start=start, end=end, text=text, words=[]))
 
     return normalize_segments(parsed)
 
 
 def parse_srt_file(path: Path) -> List[SubtitleSegment]:
-    return parse_srt_text(path.read_text(encoding="utf-8"))
+    return parse_srt_text(path.read_text(encoding="utf-8-sig"))
 
 
 def build_srt_text(segments: List[SubtitleSegment], translations: Dict[str, str] | None = None) -> str:

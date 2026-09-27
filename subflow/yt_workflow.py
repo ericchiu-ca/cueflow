@@ -218,8 +218,8 @@ def transcribe_with_faster_whisper(audio_path: Path, model_name: str = "base") -
         transcribed.append(
             SubtitleSegment(
                 id="",
-                start=round(seg.start, 2),
-                end=round(seg.end, 2),
+                start=round(seg.start, 3),
+                end=round(seg.end, 3),
                 text=text,
                 words=[],
             )

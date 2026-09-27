@@ -1,9 +1,14 @@
+import json
+import subprocess
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from subflow.bilingual import (
     VIDEO_FILTER_SOURCE,
     VIDEO_FILTER_1080P,
     SubtitleBuildError,
+    _probe_video_info,
     adapt_bilingual_ass_for_render,
     ass_escape_text,
     build_bilingual_ass_text,
@@ -52,7 +57,26 @@ Public transit shaped the city.
             build_bilingual_ass_text(self.source, self.chinese[:1])
 
     def test_ass_escapes_override_characters_and_line_breaks(self):
-        self.assertEqual(ass_escape_text("Use {x}\\path\nnext"), r"Use \{x\}\\path\Nnext")
+        self.assertEqual(
+            ass_escape_text("Use {x}\\path\nnext"),
+            "Use \\{x\\}\\\u2060path\\Nnext",
+        )
+
+    def test_ass_escape_keeps_literal_backslash_sequences_inert(self):
+        # libass reads "\\N" as a backslash followed by a line break, so a
+        # literal backslash must never be directly followed by an override letter.
+        escaped = ass_escape_text(r"C:\new \N \h")
+        self.assertNotRegex(escaped, r"\\[Nnh]")
+        self.assertEqual(escaped.replace("\u2060", ""), r"C:\new \N \h")
+
+    def test_render_layout_does_not_split_on_escaped_literal_backslash_n(self):
+        source = parse_srt_text("1\n00:00:01,000 --> 00:00:02,000\nsee \\N here\n")
+        chinese = parse_srt_text("1\n00:00:01,000 --> 00:00:02,000\n字面 \\N 保留\n")
+        editable = build_bilingual_ass_text(source, chinese)
+        output = adapt_bilingual_ass_for_render(editable, frame_width=1920, frame_height=1080)
+        dialogue = [line for line in output.splitlines() if line.startswith("Dialogue:")]
+        self.assertTrue(dialogue)
+        self.assertTrue(all("\\\u2060N" in line for line in dialogue))
 
     def test_render_layout_stacks_tracks_inside_detected_4_3_picture(self):
         editable = build_bilingual_ass_text(self.source, self.chinese)
@@ -129,3 +153,27 @@ Public transit shaped the city.
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestVideoProbe(unittest.TestCase):
+    def test_probe_reads_first_video_stream_when_audio_is_first(self):
+        # Real ffprobe lists every stream unless -select_streams narrows it,
+        # so an audio-first container used to fail geometry parsing.
+        def fake_ffprobe(command, **_kwargs):
+            if "-select_streams" in command:
+                streams = [{"width": 1280, "height": 720}]
+            else:
+                streams = [{}, {"width": 1280, "height": 720}]
+            payload = {"streams": streams, "format": {"duration": "12.5"}}
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
+
+        with (
+            patch("subflow.bilingual._ffprobe_path", return_value=Path("ffprobe")),
+            patch("subflow.bilingual.subprocess.run", side_effect=fake_ffprobe) as run,
+        ):
+            duration, geometry = _probe_video_info(Path("ffmpeg"), Path("audio-first.mkv"))
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-select_streams") + 1], "v:0")
+        self.assertEqual(duration, 12.5)
+        self.assertEqual((geometry.width, geometry.height), (1280, 720))

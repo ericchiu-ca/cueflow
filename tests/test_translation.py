@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from subflow.core import parse_srt_text
 from subflow.translation import (
@@ -118,6 +119,28 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(command[command.index("--model") + 1], "gpt-5.6-luna")
         self.assertIn("--ephemeral", command)
         self.assertEqual(command[-1], "-")
+
+    def test_codex_ignores_stale_result_from_previous_run(self):
+        segments = tuple(parse_srt_text(SOURCE_SRT))
+        with tempfile.TemporaryDirectory() as directory:
+            fake_codex = Path(directory) / "codex"
+            # Exits successfully without writing --output-last-message.
+            fake_codex.write_text("#!/bin/sh\ncat >/dev/null\nexit 0\n", encoding="utf-8")
+            fake_codex.chmod(0o755)
+            output_path = Path(directory) / "translation.result.json"
+            output_path.write_text(
+                json.dumps({"items": [{"id": "0001", "text": "旧"}, {"id": "0002", "text": "旧"}]}),
+                encoding="utf-8",
+            )
+            provider = CodexCLITranslationProvider(str(fake_codex), timeout_seconds=30)
+            request = TranslationRequest(segments, "en", "auto")
+            with patch(
+                "subflow.translation.codex_environment_status",
+                return_value={"ready": True},
+            ):
+                with self.assertRaisesRegex(TranslationError, "without writing"):
+                    provider.translate(request, output_path)
+            self.assertFalse(output_path.exists())
 
     def test_codex_prompt_contains_exact_disclosed_fields(self):
         segments = tuple(parse_srt_text(SOURCE_SRT))

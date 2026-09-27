@@ -268,6 +268,9 @@ class CodexCLITranslationProvider(TranslationProvider):
             )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Never let a previous run's result stand in for this one: IDs are only
+        # 0001..N, so a stale file with the same cue count would pass validation.
+        output_path.unlink(missing_ok=True)
         if progress:
             progress(30, "Codex is translating subtitle text with structured output...")
         try:

@@ -9,6 +9,7 @@ from subflow.core import (
     SubtitleSegment,
     build_bilingual_srt_text,
     build_srt_text,
+    parse_srt_file,
     parse_srt_text,
     parse_translation_file,
     save_master_json,
@@ -43,6 +44,23 @@ But the labor market remains surprisingly strong.
         self.assertEqual(segments[0].start, 10.0)
         self.assertEqual(segments[0].end, 13.5)
         self.assertEqual(segments[1].id, "0002")
+
+    def test_parse_srt_keeps_first_cue_after_utf8_bom(self):
+        sample = "﻿1\n00:00:01,000 --> 00:00:02,000\nFirst\n\n2\n00:00:03,000 --> 00:00:04,000\nSecond\n"
+        segments = parse_srt_text(sample)
+        self.assertEqual([segment.text for segment in segments], ["First", "Second"])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "bom.srt"
+            path.write_bytes(sample.encode("utf-8"))
+            self.assertEqual(len(parse_srt_file(path)), 2)
+
+    def test_parse_srt_preserves_millisecond_timing_round_trip(self):
+        sample = "1\n00:00:01,234 --> 00:00:02,567\nPrecise\n\n2\n00:00:03,001 --> 00:00:03,004\nShort\n"
+        segments = parse_srt_text(sample)
+        self.assertEqual([(s.start, s.end) for s in segments], [(1.234, 2.567), (3.001, 3.004)])
+        self.assertIn("00:00:01,234 --> 00:00:02,567", build_srt_text(segments))
+        self.assertIn("00:00:03,001 --> 00:00:03,004", build_srt_text(segments))
 
 
 class TestSrtOutput(unittest.TestCase):
@@ -152,7 +170,7 @@ class TestLocalTranscription(unittest.TestCase):
             }
         )
         self.assertEqual(segments[0].id, "0001")
-        self.assertEqual(segments[0].start, 1.23)
+        self.assertEqual(segments[0].start, 1.234)
         self.assertEqual(segments[0].text, "Bonjour Montreal.")
         self.assertEqual(segments[0].words[0]["probability"], 0.98)
 

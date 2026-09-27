@@ -103,11 +103,20 @@ def _plain_subtitle_text(value: str) -> str:
     return html.unescape(value).strip()
 
 
+# libass has no "\\" escape; a following word joiner keeps a literal backslash
+# from being read as the start of an override such as \N or \h.
+ASS_LITERAL_BACKSLASH = "\\\u2060"
+
+
 def ass_escape_text(value: str) -> str:
     escaped_lines: list[str] = []
     normalized = _plain_subtitle_text(value).replace("\r\n", "\n").replace("\r", "\n")
     for line in normalized.split("\n"):
-        escaped = line.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
+        escaped = (
+            line.replace("\\", ASS_LITERAL_BACKSLASH)
+            .replace("{", r"\{")
+            .replace("}", r"\}")
+        )
         escaped_lines.append(escaped.strip())
     return r"\N".join(escaped_lines)
 
@@ -207,6 +216,8 @@ def _ass_text_tokens(value: str) -> list[str]:
 def _ass_token_character(token: str) -> str:
     if token.startswith("{"):
         return ""
+    if token == ASS_LITERAL_BACKSLASH:
+        return "\\"
     if token.startswith("\\") and len(token) == 2:
         return " " if token == r"\h" else token[1]
     return token
@@ -491,6 +502,8 @@ def _probe_video_info(ffmpeg: Path, video: Path) -> tuple[float | None, _VideoGe
                 str(ffprobe),
                 "-v",
                 "error",
+                "-select_streams",
+                "v:0",
                 "-show_entries",
                 "format=duration:stream=width,height",
                 "-of",
