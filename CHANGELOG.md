@@ -49,6 +49,10 @@
 - YouTube 字幕检测改用 yt-dlp 的结构化 JSON；原先按 `--list-subs` 文本匹配 "automatic subtitles"，而 yt-dlp 实际输出 "automatic captions"，导致自动字幕被当成人工字幕。自动字幕只接受原始语音轨（`en-orig`），不再把非英语视频的机器翻译当作英文原文。
 - Web 响应增加 `X-Frame-Options: DENY`、`frame-ancestors 'none'`、`nosniff` 和 `no-referrer`，防止页面被第三方网站嵌入做点击劫持。
 - QC 与审校共用稳定 ID 规则（4 位以上数字）；超过 9999 条字幕时 QC 不再误报 `INVALID_ID`。
+- WhisperX 对齐后只在文本确实对应时才恢复原字幕文本；条数相同但中间错位时不再把文本贴到错误的时间上。
+- `align-project` 新增 `--source`，可对 `transcribe-file` 生成、媒体不在项目目录中的项目重新对齐（文件名须与 `master.json` 记录一致）；语言选项增加 `mixed`。
+- ASR worker 失败时报告其结构化错误并截断，不再把整段库日志塞进任务消息；worker 响应校验类型和协议版本。
+- VAD 级联按阶段上报进度（VAD、Turbo、large-v3 复核、合并），Web 进度不再长时间停在 32%。
 - SRT 时间行允许携带位置等 cue 设置（如 `X1:10 X2:20`），不再整份文件被拒；格式错误时报告出错的块号。
 - WhisperX/MLX 输出中的 NaN、Infinity 时间不再进入 `master.json` 与 SRT。
 - 压制上传只接受视频扩展名、转录上传只接受支持的音视频扩展名，并在创建项目目录前校验；上传文件不再可能与项目内固定的 `bilingual.ass`、`output` 冲突。编码 profile 错误提示列出全部可选值。

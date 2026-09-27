@@ -194,6 +194,25 @@ class TestLocalTranscription(unittest.TestCase):
         self.assertEqual(segments[0].text, "Bonjour Montreal.")
         self.assertEqual(segments[0].words[0]["probability"], 0.98)
 
+    def test_aligned_text_is_restored_only_for_matching_cues(self):
+        from subflow.transcription import _preserve_aligned_text
+
+        originals = [
+            SubtitleSegment("0001", 0.0, 1.0, "Hello,  world!", []),
+            SubtitleSegment("0002", 1.0, 2.0, "Second line.", []),
+            SubtitleSegment("0003", 2.0, 3.0, "Third line.", []),
+        ]
+        # Same count, but WhisperX split the first cue and dropped the second.
+        aligned = [
+            SubtitleSegment("", 0.0, 0.5, "hello world", []),
+            SubtitleSegment("", 0.5, 1.0, "extra split", []),
+            SubtitleSegment("", 2.0, 3.0, "third line", []),
+        ]
+        restored = _preserve_aligned_text(aligned, originals)
+        self.assertEqual(
+            [s.text for s in restored], ["Hello,  world!", "extra split", "Third line."]
+        )
+
     def test_non_finite_timings_are_dropped(self):
         nan, inf = float("nan"), float("inf")
         segments = segments_from_result(
@@ -415,6 +434,32 @@ class TestLocalTranscription(unittest.TestCase):
             self.assertEqual(metadata["alignment"], "whisperx-mixed")
             self.assertEqual(metadata["confidence_windows"][1]["segment_ids"], ["0002", "0003"])
             self.assertEqual(metadata["quality_issues"][0]["segment_ids"], ["0002", "0003"])
+
+    def test_realign_accepts_media_outside_the_project_via_source(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value)
+            project = root / "project"
+            project.mkdir()
+            media = root / "videos" / "talk.mp4"
+            media.parent.mkdir()
+            media.write_bytes(b"source")
+            segments = [SubtitleSegment("0001", 0.0, 1.0, "Hello", [])]
+            save_master_json(project / "master.json", segments, metadata={"source": "talk.mp4", "language": "en"})
+            with self.assertRaisesRegex(TranscriptionError, "--source"):
+                align_existing_project(project)
+            other = root / "videos" / "other.mp4"
+            other.write_bytes(b"x")
+            with self.assertRaisesRegex(TranscriptionError, "talk.mp4"):
+                align_existing_project(project, source_path=other)
+            with (
+                patch("subflow.transcription._run_ffmpeg") as ffmpeg,
+                patch("subflow.transcription._run_whisperx_alignment", return_value=segments),
+                patch("subflow.transcription.find_whisperx_python", return_value=Path("/mock/python")),
+                patch("subflow.transcription.whisperx_version", return_value="3.8.6"),
+            ):
+                artifact = align_existing_project(project, source_path=media)
+            self.assertEqual(ffmpeg.call_args.args[0], media.resolve())
+            self.assertTrue(artifact.srt_path.is_file())
 
     def test_mixed_language_realign_without_windows_fails_clearly(self):
         with tempfile.TemporaryDirectory() as temp_value:

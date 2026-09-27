@@ -183,6 +183,7 @@ def cmd_align_project(args: argparse.Namespace) -> int:
         language=args.language,
         whisperx_python=args.whisperx_python,
         progress=lambda _stage, percent, message: print(f"[{percent:3d}%] {message}"),
+        source_path=args.source,
     )
     print(f"Generated aligned SRT: {result.srt_path}")
     print(f"Aligned master data: {result.master_path}")
@@ -326,8 +327,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     align.add_argument("project", help="Existing Subflow project directory")
     align.add_argument(
+        "--source",
+        help="Original media file when it is not inside the project (e.g. after transcribe-file)",
+    )
+    align.add_argument(
         "--language",
-        choices=("en", "fr-CA"),
+        choices=("en", "fr-CA", "mixed"),
         help="Override the language stored in master.json",
     )
     align.add_argument(

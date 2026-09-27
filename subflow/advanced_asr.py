@@ -87,6 +87,23 @@ def _offline_env(base: dict[str, str]) -> dict[str, str]:
     return env
 
 
+WORKER_ERROR_DETAIL_CHARS = 2000
+
+
+def _worker_error_detail(stderr: str, stdout: str) -> str:
+    """Prefer the worker's structured error over the library noise before it."""
+    marker = stderr.rfind('{"protocol"')
+    if marker >= 0:
+        try:
+            payload = json.loads(stderr[marker:].strip())
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict) and payload.get("error"):
+            return f"{payload.get('error_type') or 'Error'}: {payload['error']}"[-WORKER_ERROR_DETAIL_CHARS:]
+    detail = stderr.strip() or stdout.strip() or "unknown error"
+    return detail[-WORKER_ERROR_DETAIL_CHARS:]
+
+
 def _run_json_worker(
     python: Path, script: Path, request: dict, environment: dict[str, str]
 ) -> dict:
@@ -97,12 +114,22 @@ def _run_json_worker(
         env=environment,
     )
     if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
-        raise RuntimeError(f"{script.name} exited with {completed.returncode}: {detail}")
+        raise RuntimeError(
+            f"{script.name} exited with {completed.returncode}: "
+            + _worker_error_detail(completed.stderr, completed.stdout)
+        )
     try:
-        return json.loads(completed.stdout)
+        response = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"{script.name} returned invalid JSON") from exc
+    if not isinstance(response, dict):
+        raise RuntimeError(f"{script.name} returned a non-object response")
+    expected = request.get("protocol")
+    if expected and response.get("protocol") != expected:
+        raise RuntimeError(
+            f"{script.name} answered protocol {response.get('protocol')!r}, expected {expected!r}"
+        )
+    return response
 
 
 def _helper_python(helper_path: Path) -> Path:
@@ -139,7 +166,12 @@ def _batch_results(
         {"protocol": MLX_PROTOCOL, "model_path": str(model), "items": items},
         environment,
     )
-    return {str(item.get("id", "")): item for item in response.get("items", [])}
+    items = response.get("items")
+    return {
+        str(item.get("id", "")): item
+        for item in (items if isinstance(items, list) else [])
+        if isinstance(item, dict)
+    }
 
 
 def _finite(value: object) -> float | None:
@@ -663,13 +695,16 @@ def transcribe_vad_cascade(
     parse_result: Callable,
     quality_analyzer: Callable,
     environment_factory: Callable[[], dict[str, str]],
+    progress: Callable[[int, str], None] | None = None,
 ) -> AdvancedAsrResult:
     """VAD windows -> Turbo -> large-v3 for weak windows -> best candidate each."""
+    report = progress or (lambda _percent, _message: None)
     if language not in {"en", "fr", "mixed"}:
         raise RuntimeError(f"Unsupported advanced ASR language: {language}")
     worker_python = _helper_python(helper_path)
     environment = _offline_env(environment_factory())
     requested_language = {"en": "en", "fr": "fr", "mixed": "auto"}[language]
+    report(34, "正在检测语音活动窗口（VAD）")
     vad = _run_json_worker(
         whisperx_python,
         Path(__file__).with_name("vad_runner.py"),
@@ -697,6 +732,7 @@ def transcribe_vad_cascade(
             {"id": str(window["index"]), "audio_path": str(clip), "language": requested_language}
             for window, clip in zip(windows, clips)
         ]
+        report(40, f"正在用 Turbo 转写 {len(windows)} 个语音窗")
         turbo_output = _batch_results(worker_python, turbo_model, turbo_items, environment)
         turbo_candidates = [
             _candidate(
@@ -730,11 +766,14 @@ def transcribe_vad_cascade(
             for index, languages in retry_languages.items()
             for retry_language in languages
         ]
+        if large_items:
+            report(58, f"正在用 large-v3 复核 {len(retry_languages)} 个低置信度语音窗")
         large_output = (
             _batch_results(worker_python, large_model, large_items, environment)
             if large_items
             else {}
         )
+        report(72, "正在比较候选并合并语音窗")
 
         selected_window_segments: list[list[SubtitleSegment]] = []
         quality_issues: list[dict] = []
