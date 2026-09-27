@@ -37,6 +37,11 @@
 - 本地清理会等待进行中的上传、ASS/审校创建和保存完成后再执行；删除在锁外进行，不再阻塞状态轮询。默认样式预览渲染加锁并原子替换。
 - 新增 `subflow/proc.py`：外部命令在独立进程组中运行，超时或出错时连同子进程（如 yt-dlp 调起的 FFmpeg）一起终止；Web 服务退出时终止所有子进程，Ctrl+C 不再等待当前任务跑完。
 - FFmpeg 音频提取和片段提取增加 `-nostdin` 与超时；压制进度回调异常时终止 FFmpeg 并删除不完整的输出。
+- 带旋转元数据的视频（如 iPhone 竖屏）按显示方向计算 ASS 布局，不再按存储方向把字幕挤压变形。
+- VAD 级联所有语音窗都失败时报错并回退，不再输出空字幕却显示完成；回退警告保留失败原因。
+- mixed 语言项目可以重新对齐（按语音窗语言分别对齐）；重新对齐后刷新置信度窗口和质量问题中的字幕 ID。
+- YouTube 字幕检测改用 yt-dlp 的结构化 JSON；原先按 `--list-subs` 文本匹配 "automatic subtitles"，而 yt-dlp 实际输出 "automatic captions"，导致自动字幕被当成人工字幕。自动字幕只接受原始语音轨（`en-orig`），不再把非英语视频的机器翻译当作英文原文。
+- Web 响应增加 `X-Frame-Options: DENY`、`frame-ancestors 'none'`、`nosniff` 和 `no-referrer`，防止页面被第三方网站嵌入做点击劫持。
 - 合并并持续读取 FFmpeg 输出，避免管道阻塞；为 YouTube 外部命令增加可运行性检查与超时。
 - 上传先写入临时文件再原子重命名，失败任务会进入失败状态。
 - wheel 包含 Web 静态文件、JSON Schema 和字体资源。

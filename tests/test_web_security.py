@@ -207,6 +207,24 @@ class WebRobustnessTests(unittest.TestCase):
             finally:
                 fixture.close()
 
+    def test_responses_forbid_framing(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            fixture = ServerFixture(Path(temp_value) / "output")
+            try:
+                for path in ("/", "/api/does-not-exist"):
+                    connection = http.client.HTTPConnection(
+                        "127.0.0.1", fixture.server.server_address[1], timeout=5
+                    )
+                    connection.request("GET", path)
+                    response = connection.getresponse()
+                    response.read()
+                    self.assertEqual(response.getheader("X-Frame-Options"), "DENY")
+                    self.assertIn("frame-ancestors 'none'", response.getheader("Content-Security-Policy"))
+                    self.assertEqual(response.getheader("X-Content-Type-Options"), "nosniff")
+                    connection.close()
+            finally:
+                fixture.close()
+
     def test_unexpected_get_error_returns_json_500(self):
         with tempfile.TemporaryDirectory() as temp_value:
             fixture = ServerFixture(Path(temp_value) / "output")

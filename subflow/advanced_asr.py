@@ -697,6 +697,18 @@ def transcribe_vad_cascade(
         owned_windows = _apply_ownership_boundaries(selected_window_segments, windows)
         selected_segments = [segment for group in owned_windows for segment in group]
         segments = normalize_segments(sorted(selected_segments, key=lambda item: (item.start, item.end)))
+        if not segments:
+            # Every window failing (e.g. unloadable weights) must not look like
+            # a successful, empty transcription.
+            failures = [
+                str(issue["message"])
+                for issue in quality_issues
+                if issue.get("code") == "ASR_WINDOW_FAILED"
+            ]
+            raise RuntimeError(
+                "VAD cascade produced no subtitle segments"
+                + (f" ({len(failures)} window(s) failed; first: {failures[0][:300]})" if failures else "")
+            )
         for window in confidence_windows:
             window["segment_ids"] = [
                 segment.id

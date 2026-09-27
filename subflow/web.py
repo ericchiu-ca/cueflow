@@ -787,6 +787,15 @@ class CueFlowHandler(BaseHTTPRequestHandler):
     def csrf_token(self) -> str:
         return self.server.csrf_token  # type: ignore[attr-defined]
 
+    def end_headers(self) -> None:
+        # Loopback Host checks do not stop another site from framing the UI
+        # (e.g. clickjacking the cleanup button), so forbid framing outright.
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        super().end_headers()
+
     def log_message(self, format: str, *args: object) -> None:
         print(f"[web] {self.address_string()} {format % args}")
 

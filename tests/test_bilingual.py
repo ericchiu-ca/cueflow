@@ -184,6 +184,31 @@ class TestVideoProbe(unittest.TestCase):
         self.assertEqual((geometry.width, geometry.height), (1280, 720))
 
 
+    def test_probe_swaps_dimensions_for_quarter_turn_rotation(self):
+        def probe_payload(stream):
+            payload = {"streams": [stream], "format": {"duration": "3"}}
+
+            def fake_ffprobe(command, **_kwargs):
+                return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
+
+            return fake_ffprobe
+
+        cases = [
+            ({"width": 1920, "height": 1080, "side_data_list": [{"rotation": -90}]}, (1080, 1920)),
+            ({"width": 1920, "height": 1080, "tags": {"rotate": "270"}}, (1080, 1920)),
+            ({"width": 1920, "height": 1080, "side_data_list": [{"rotation": 180}]}, (1920, 1080)),
+            ({"width": 1920, "height": 1080}, (1920, 1080)),
+        ]
+        for stream, expected in cases:
+            with (
+                self.subTest(stream=stream),
+                patch("subflow.bilingual._ffprobe_path", return_value=Path("ffprobe")),
+                patch("subflow.bilingual.subprocess.run", side_effect=probe_payload(stream)),
+            ):
+                _duration, geometry = _probe_video_info(Path("ffmpeg"), Path("clip.mov"))
+                self.assertEqual((geometry.width, geometry.height), expected)
+
+
 class TestBurnProcessCleanup(unittest.TestCase):
     def test_failing_progress_callback_kills_ffmpeg_and_removes_partial_output(self):
         source = parse_srt_text("1\n00:00:01,000 --> 00:00:02,000\nHello\n")

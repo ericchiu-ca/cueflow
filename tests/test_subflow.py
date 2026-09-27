@@ -322,3 +322,69 @@ class TestLocalTranscription(unittest.TestCase):
             self.assertEqual(metadata["model_path"], "turbo")
             self.assertEqual(metadata["large_v3_model_path"], "large-v3")
             self.assertNotIn(str(legacy_home), aligned_text)
+
+    def test_mixed_language_project_realigns_per_window_language(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            project = Path(temp_value) / "project"
+            project.mkdir()
+            (project / "talk.mp4").write_bytes(b"source")
+            segments = [
+                SubtitleSegment("0001", 0.0, 2.0, "Hello there", []),
+                SubtitleSegment("0002", 2.0, 4.0, "Bonjour à tous", []),
+            ]
+            save_master_json(
+                project / "master.json",
+                segments,
+                metadata={
+                    "source": "talk.mp4",
+                    "language": "mixed",
+                    "confidence_windows": [
+                        {"start": 0.0, "end": 2.0, "language": "en", "segment_ids": ["0001"]},
+                        {"start": 2.0, "end": 4.0, "language": "fr", "segment_ids": ["0002"]},
+                    ],
+                    "quality_issues": [
+                        {"start": 2.5, "end": 3.0, "id": "0009", "segment_ids": ["0009"]}
+                    ],
+                },
+            )
+            # WhisperX splits the French cue in two, shifting later IDs.
+            def fake_alignment(_wav, subset, *, language, **_kwargs):
+                if language == "fr":
+                    return [
+                        SubtitleSegment("", 2.0, 2.8, "Bonjour", []),
+                        SubtitleSegment("", 2.8, 4.0, "à tous", []),
+                    ]
+                return list(subset)
+
+            with (
+                patch("subflow.transcription._run_ffmpeg"),
+                patch(
+                    "subflow.transcription._run_whisperx_alignment",
+                    side_effect=fake_alignment,
+                ) as alignment,
+                patch("subflow.transcription.find_whisperx_python", return_value=Path("/mock/python")),
+                patch("subflow.transcription.whisperx_version", return_value="3.8.6"),
+            ):
+                artifact = align_existing_project(project)
+
+            self.assertEqual(
+                sorted(call.kwargs["language"] for call in alignment.call_args_list),
+                ["en", "fr"],
+            )
+            metadata = json.loads(artifact.master_path.read_text(encoding="utf-8"))["metadata"]
+            self.assertEqual(metadata["alignment"], "whisperx-mixed")
+            self.assertEqual(metadata["confidence_windows"][1]["segment_ids"], ["0002", "0003"])
+            self.assertEqual(metadata["quality_issues"][0]["segment_ids"], ["0002", "0003"])
+
+    def test_mixed_language_realign_without_windows_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            project = Path(temp_value) / "project"
+            project.mkdir()
+            (project / "talk.mp4").write_bytes(b"source")
+            save_master_json(
+                project / "master.json",
+                [SubtitleSegment("0001", 0.0, 1.0, "Hello", [])],
+                metadata={"source": "talk.mp4", "language": "mixed"},
+            )
+            with self.assertRaisesRegex(TranscriptionError, "per-window language"):
+                align_existing_project(project)

@@ -288,6 +288,44 @@ class TestAdvancedAsr(unittest.TestCase):
         self.assertEqual(result.confidence_windows[0]["model"], "large-v3")
         self.assertEqual(result.segments[0].text, "correct transcript")
 
+    def test_cascade_raises_when_every_window_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch("subflow.advanced_asr._helper_python", return_value=Path("/fake/python")),
+                patch(
+                    "subflow.advanced_asr._run_json_worker",
+                    return_value={
+                        "windows": [
+                            {"index": 1, "start": 0.0, "end": 2.0, "duration": 2.0}
+                        ]
+                    },
+                ),
+                patch(
+                    "subflow.advanced_asr._write_clips",
+                    return_value=[Path("/fake/window.wav")],
+                ),
+                patch(
+                    "subflow.advanced_asr._batch_results",
+                    side_effect=lambda *args, **kwargs: {
+                        key: {"id": key, "error": "model weights could not be loaded"}
+                        for key in ("1", "1:en", "1:fr")
+                    },
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "no subtitle segments.*weights"):
+                    transcribe_vad_cascade(
+                        wav_path=Path("/fake/audio.wav"),
+                        project_dir=Path(directory),
+                        language="en",
+                        turbo_model=Path("/fake/turbo"),
+                        large_model=Path("/fake/large"),
+                        helper_path=Path("/fake/run"),
+                        whisperx_python=Path("/fake/whisperx"),
+                        parse_result=segments_from_result,
+                        quality_analyzer=lambda _result: [],
+                        environment_factory=dict,
+                    )
+
     def test_whisperx_chunk_dicts_are_converted_to_spans(self):
         self.assertEqual(
             _chunk_spans(

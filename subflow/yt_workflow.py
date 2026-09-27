@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -94,38 +95,29 @@ def detect_english_subtitles(url: str) -> tuple[str | None, str | None]:
     """
     yt_dlp = ensure_command(YT_DLP)
     output = run_command(
-        [yt_dlp, "--list-subs", "--skip-download", "--no-playlist", url],
+        [yt_dlp, "--dump-single-json", "--skip-download", "--no-playlist", url],
         timeout_seconds=180,
     )
-    manual = []
-    auto = []
-    mode = "manual"
+    try:
+        info = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("yt-dlp returned invalid video metadata JSON.") from error
+    if not isinstance(info, dict):
+        raise RuntimeError("yt-dlp returned unexpected video metadata.")
+    return pick_english_tracks(
+        list(info.get("subtitles") or {}),
+        list(info.get("automatic_captions") or {}),
+    )
 
-    for line in output.split("\n"):
-        low = line.strip().lower()
-        if not low:
-            continue
-        if "available subtitles for" in low and "automatic" not in low:
-            mode = "manual"
-            continue
-        if "available automatic subtitles for" in low:
-            mode = "auto"
-            continue
-        if low.startswith("language"):
-            continue
-        if not line[0].isalnum():
-            continue
 
-        lang = line.strip().split()[0]
-        if not lang or lang.lower() == "none":
-            continue
-        if mode == "manual":
-            manual.append(lang)
-        elif mode == "auto":
-            auto.append(lang)
-
+def pick_english_tracks(manual: list[str], auto: list[str]) -> tuple[str | None, str | None]:
     manual_en = next((lang for lang in manual if lang.lower().startswith("en")), None)
-    auto_en = next((lang for lang in auto if lang.lower().startswith("en")), None)
+    # YouTube lists machine translations of the original ASR track as ordinary
+    # languages; only "<lang>-orig" is the speech itself. When the original is
+    # not English, an automatic "en" track is a translation, not a transcript.
+    originals = [lang for lang in auto if lang.lower().endswith("-orig")]
+    candidates = originals if originals else auto
+    auto_en = next((lang for lang in candidates if lang.lower().startswith("en")), None)
     return manual_en, auto_en
 
 

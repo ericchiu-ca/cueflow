@@ -579,7 +579,8 @@ def transcribe_with_mlx(
             if language == "mixed":
                 raise TranscriptionError(f"Mixed-language VAD cascade failed: {error}") from error
             cascade_warning = (
-                "VAD/large-v3 cascade failed; used full-file Turbo fallback"
+                "VAD/large-v3 cascade failed; used full-file Turbo fallback: "
+                + str(error)[:300]
             )
     else:
         missing: list[str] = []
@@ -1219,6 +1220,14 @@ def align_existing_project(
     segments = load_master_json(master_path)
     if not segments:
         raise TranscriptionError("master.json contains no subtitle segments")
+    confidence_windows = metadata.get("confidence_windows")
+    if not isinstance(confidence_windows, list):
+        confidence_windows = []
+    if whisper_language == "mixed" and not confidence_windows:
+        raise TranscriptionError(
+            "This mixed-language project has no per-window language metadata; "
+            "realign it with language en or fr-CA instead."
+        )
     python_path = find_whisperx_python(whisperx_python)
     version = whisperx_version(python_path)
     if python_path is None or version is None:
@@ -1233,13 +1242,23 @@ def align_existing_project(
         update("audio", 20, "正在为现有字幕提取音频")
         _run_ffmpeg(source, wav_path)
         update("aligning", 55, "正在使用 WhisperX 重新对齐现有字幕")
-        aligned = _run_whisperx_alignment(
-            wav_path,
-            segments,
-            language=whisper_language,
-            python_path=python_path,
-            cache_dir=Path(__file__).resolve().parents[1] / ".cache" / "whisperx",
-        )
+        cache_dir = Path(__file__).resolve().parents[1] / ".cache" / "whisperx"
+        if whisper_language == "mixed":
+            aligned = _run_mixed_whisperx_alignment(
+                wav_path,
+                segments,
+                confidence_windows,
+                python_path=python_path,
+                cache_dir=cache_dir,
+            )
+        else:
+            aligned = _run_whisperx_alignment(
+                wav_path,
+                segments,
+                language=whisper_language,
+                python_path=python_path,
+                cache_dir=cache_dir,
+            )
         update("writing", 92, "正在写入独立的 WhisperX 产物")
         aligned_master = project / "master.whisperx.json"
         output_dir = project / "output"
@@ -1251,9 +1270,28 @@ def align_existing_project(
                 aligned_metadata[key] = _portable_model_reference(
                     str(aligned_metadata[key])
                 )
+        # WhisperX re-splits segments, so IDs from the old timeline are stale.
+        if confidence_windows:
+            aligned_metadata["confidence_windows"] = _attach_confidence_window_ids(
+                confidence_windows, aligned
+            )
+        if isinstance(metadata.get("quality_issues"), list):
+            timed_issues = [
+                {
+                    key: value
+                    for key, value in issue.items()
+                    if key not in {"id", "segment_ids"}
+                    or not isinstance(issue.get("start"), (int, float))
+                }
+                for issue in metadata["quality_issues"]
+                if isinstance(issue, dict)
+            ]
+            aligned_metadata["quality_issues"] = _attach_quality_issue_ids(
+                timed_issues, aligned
+            )
         aligned_metadata.update(
             {
-                "alignment": "whisperx",
+                "alignment": "whisperx-mixed" if whisper_language == "mixed" else "whisperx",
                 "whisperx_version": version,
                 "derived_from": master_path.name,
                 "warnings": [],

@@ -495,6 +495,19 @@ def _ffprobe_path(ffmpeg: Path) -> Path:
     return ffprobe
 
 
+def _stream_rotation(stream: dict) -> int:
+    for side_data in stream.get("side_data_list") or []:
+        if isinstance(side_data, dict) and "rotation" in side_data:
+            try:
+                return round(float(side_data["rotation"])) % 360
+            except (TypeError, ValueError):
+                return 0
+    try:
+        return round(float((stream.get("tags") or {}).get("rotate", 0))) % 360
+    except (TypeError, ValueError):
+        return 0
+
+
 def _probe_video_info(ffmpeg: Path, video: Path) -> tuple[float | None, _VideoGeometry]:
     ffprobe = _ffprobe_path(ffmpeg)
     try:
@@ -506,7 +519,7 @@ def _probe_video_info(ffmpeg: Path, video: Path) -> tuple[float | None, _VideoGe
                 "-select_streams",
                 "v:0",
                 "-show_entries",
-                "format=duration:stream=width,height",
+                "format=duration:stream=width,height:stream_side_data=rotation:stream_tags=rotate",
                 "-of",
                 "json",
                 str(video),
@@ -527,10 +540,15 @@ def _probe_video_info(ffmpeg: Path, video: Path) -> tuple[float | None, _VideoGe
         width = int(stream["width"])
         height = int(stream["height"])
         duration_value = float(payload.get("format", {}).get("duration", 0))
+        rotation = _stream_rotation(stream)
     except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise VideoBurnError("FFprobe returned incomplete video geometry.") from error
     if width <= 0 or height <= 0:
         raise VideoBurnError("FFprobe returned invalid video dimensions.")
+    if rotation % 180 == 90:
+        # FFmpeg autorotates before the filter graph, so libass and cropdetect
+        # see the displayed (portrait) frame, not the stored one.
+        width, height = height, width
     duration = duration_value if duration_value > 0 else None
     return duration, _VideoGeometry(width, height)
 
