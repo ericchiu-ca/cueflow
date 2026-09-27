@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import subprocess
 import tempfile
 import wave
 from dataclasses import dataclass
@@ -13,6 +12,7 @@ from statistics import mean
 from typing import Callable
 
 from .core import SubtitleSegment, normalize_segments
+from .proc import run_captured
 
 
 VAD_PROTOCOL = "cueflow-vad-v1"
@@ -89,12 +89,9 @@ def _offline_env(base: dict[str, str]) -> dict[str, str]:
 def _run_json_worker(
     python: Path, script: Path, request: dict, environment: dict[str, str]
 ) -> dict:
-    completed = subprocess.run(
+    completed = run_captured(
         [str(python), str(script)],
         input=json.dumps(request, ensure_ascii=False),
-        text=True,
-        capture_output=True,
-        check=False,
         timeout=28800,
         env=environment,
     )
@@ -700,6 +697,18 @@ def transcribe_vad_cascade(
         owned_windows = _apply_ownership_boundaries(selected_window_segments, windows)
         selected_segments = [segment for group in owned_windows for segment in group]
         segments = normalize_segments(sorted(selected_segments, key=lambda item: (item.start, item.end)))
+        if not segments:
+            # Every window failing (e.g. unloadable weights) must not look like
+            # a successful, empty transcription.
+            failures = [
+                str(issue["message"])
+                for issue in quality_issues
+                if issue.get("code") == "ASR_WINDOW_FAILED"
+            ]
+            raise RuntimeError(
+                "VAD cascade produced no subtitle segments"
+                + (f" ({len(failures)} window(s) failed; first: {failures[0][:300]})" if failures else "")
+            )
         for window in confidence_windows:
             window["segment_ids"] = [
                 segment.id

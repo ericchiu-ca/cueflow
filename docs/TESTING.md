@@ -85,6 +85,18 @@ cueflow burn --help
 
 `test_post_requires_process_csrf_token` 必须真实绑定 loopback 端口。受限沙箱中的 `PermissionError: [Errno 1] Operation not permitted` 是执行环境限制；只有在允许 loopback 的环境重跑并通过后，才能把该测试计为通过。
 
+2026-09-26 在 `fix/review-findings` 分支修复代码审查问题后的本地复核：
+
+| 环境/命令 | 结果 |
+| --- | --- |
+| Python 3.11.15，完整 unittest，允许本机 loopback | 73/73 通过 |
+| Python 3.12.14，完整 unittest，允许本机 loopback | 73/73 通过 |
+| Python 3.11.15，wheel build 后装入独立 venv，在仓库外导入 schema/静态页并运行 `cueflow --help` | 成功 |
+| `ffmpeg-full`（libass）真实渲染反斜杠转义文本、音轨在前的 MKV 探测、90° 旋转视频端到端烧录 | 结果符合预期 |
+| 真实启动 `cueflow web`，经浏览器调用审校创建/保存/下载、ASS 生成、预览和清理 API | 结果符合预期 |
+
+新增的每个回归测试都在修复前的代码上失败、修复后通过。
+
 仓库中没有 JUnit artifact、coverage artifact 或 release verification record。公开历史从当前快照开始；更早代码状态及其测试结果**无法从本仓库确认**。
 
 ## CI 覆盖范围
@@ -94,13 +106,14 @@ cueflow burn --help
 - push 到 `main`；
 - 任意 pull request。
 
-单个 `unit` job 使用 `macos-14`、15 分钟 timeout 和 Python 3.11/3.13 matrix，步骤为：
+单个 `unit` job 使用 `macos-14`、15 分钟 timeout 和 Python 3.11/3.12/3.13 matrix，步骤为：
 
 1. `actions/checkout@v4`；
 2. `actions/setup-python@v5`，启用 pip cache；
 3. `python -m pip install -e .`；
 4. `python -m unittest discover -s tests -v`；
 5. `python -m pip wheel . --no-deps -w dist`。
+6. 把 wheel 安装进独立 venv，在仓库目录之外确认 translation schema 和静态页面随包安装，并运行 `cueflow --help`。
 
 CI workflow 只授予 `contents: read`。它不发布 wheel、不创建 tag/Release、不上传测试报告，也不修改云端环境。
 

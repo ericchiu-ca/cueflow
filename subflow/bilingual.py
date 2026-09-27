@@ -16,6 +16,7 @@ from statistics import median
 from typing import Callable, Iterable
 
 from .core import SubtitleSegment, parse_srt_file
+from .proc import kill_tree, popen, release
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -103,11 +104,20 @@ def _plain_subtitle_text(value: str) -> str:
     return html.unescape(value).strip()
 
 
+# libass has no "\\" escape; a following word joiner keeps a literal backslash
+# from being read as the start of an override such as \N or \h.
+ASS_LITERAL_BACKSLASH = "\\\u2060"
+
+
 def ass_escape_text(value: str) -> str:
     escaped_lines: list[str] = []
     normalized = _plain_subtitle_text(value).replace("\r\n", "\n").replace("\r", "\n")
     for line in normalized.split("\n"):
-        escaped = line.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
+        escaped = (
+            line.replace("\\", ASS_LITERAL_BACKSLASH)
+            .replace("{", r"\{")
+            .replace("}", r"\}")
+        )
         escaped_lines.append(escaped.strip())
     return r"\N".join(escaped_lines)
 
@@ -207,6 +217,8 @@ def _ass_text_tokens(value: str) -> list[str]:
 def _ass_token_character(token: str) -> str:
     if token.startswith("{"):
         return ""
+    if token == ASS_LITERAL_BACKSLASH:
+        return "\\"
     if token.startswith("\\") and len(token) == 2:
         return " " if token == r"\h" else token[1]
     return token
@@ -483,6 +495,19 @@ def _ffprobe_path(ffmpeg: Path) -> Path:
     return ffprobe
 
 
+def _stream_rotation(stream: dict) -> int:
+    for side_data in stream.get("side_data_list") or []:
+        if isinstance(side_data, dict) and "rotation" in side_data:
+            try:
+                return round(float(side_data["rotation"])) % 360
+            except (TypeError, ValueError):
+                return 0
+    try:
+        return round(float((stream.get("tags") or {}).get("rotate", 0))) % 360
+    except (TypeError, ValueError):
+        return 0
+
+
 def _probe_video_info(ffmpeg: Path, video: Path) -> tuple[float | None, _VideoGeometry]:
     ffprobe = _ffprobe_path(ffmpeg)
     try:
@@ -491,8 +516,10 @@ def _probe_video_info(ffmpeg: Path, video: Path) -> tuple[float | None, _VideoGe
                 str(ffprobe),
                 "-v",
                 "error",
+                "-select_streams",
+                "v:0",
                 "-show_entries",
-                "format=duration:stream=width,height",
+                "format=duration:stream=width,height:stream_side_data=rotation:stream_tags=rotate",
                 "-of",
                 "json",
                 str(video),
@@ -513,10 +540,15 @@ def _probe_video_info(ffmpeg: Path, video: Path) -> tuple[float | None, _VideoGe
         width = int(stream["width"])
         height = int(stream["height"])
         duration_value = float(payload.get("format", {}).get("duration", 0))
+        rotation = _stream_rotation(stream)
     except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise VideoBurnError("FFprobe returned incomplete video geometry.") from error
     if width <= 0 or height <= 0:
         raise VideoBurnError("FFprobe returned invalid video dimensions.")
+    if rotation % 180 == 90:
+        # FFmpeg autorotates before the filter graph, so libass and cropdetect
+        # see the displayed (portrait) frame, not the stored one.
+        width, height = height, width
     duration = duration_value if duration_value > 0 else None
     return duration, _VideoGeometry(width, height)
 
@@ -758,6 +790,7 @@ def burn_ass_into_video(
         (temp / "fonts").symlink_to(fonts, target_is_directory=True)
         command = [
             str(ffmpeg),
+            "-nostdin",
             "-hide_banner",
             "-loglevel",
             "error",
@@ -789,7 +822,7 @@ def burn_ass_into_video(
             str(output),
         ]
         try:
-            process = subprocess.Popen(
+            process = popen(
                 command,
                 cwd=temp,
                 stdout=subprocess.PIPE,
@@ -803,19 +836,29 @@ def burn_ass_into_video(
         assert process.stdout is not None
         last_percent = 3
         output_tail: deque[str] = deque(maxlen=200)
-        for raw_line in process.stdout:
-            output_tail.append(raw_line)
-            key, separator, value = raw_line.strip().partition("=")
-            if separator and key == "out_time_us" and duration:
-                try:
-                    elapsed = int(value) / 1_000_000
-                except ValueError:
-                    continue
-                percent = min(98, max(3, int(elapsed / duration * 95) + 3))
-                if percent >= last_percent + 2:
-                    last_percent = percent
-                    report("encoding", percent, f"Burning subtitles into video ({percent}%)")
-        return_code = process.wait()
+        try:
+            for raw_line in process.stdout:
+                output_tail.append(raw_line)
+                key, separator, value = raw_line.strip().partition("=")
+                if separator and key == "out_time_us" and duration:
+                    try:
+                        elapsed = int(value) / 1_000_000
+                    except ValueError:
+                        continue
+                    percent = min(98, max(3, int(elapsed / duration * 95) + 3))
+                    if percent >= last_percent + 2:
+                        last_percent = percent
+                        report("encoding", percent, f"Burning subtitles into video ({percent}%)")
+            return_code = process.wait()
+        except BaseException:
+            # A failing progress callback or interrupt must not leave FFmpeg
+            # running with a full pipe and a half-written MP4.
+            kill_tree(process)
+            output.unlink(missing_ok=True)
+            raise
+        finally:
+            process.stdout.close()
+            release(process)
         if return_code != 0:
             output.unlink(missing_ok=True)
             detail = "".join(output_tail).strip()

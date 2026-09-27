@@ -1,9 +1,19 @@
+import json
+import os
+import subprocess
+import tempfile
+import time
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from subflow.bilingual import (
     VIDEO_FILTER_SOURCE,
     VIDEO_FILTER_1080P,
     SubtitleBuildError,
+    _VideoGeometry,
+    _probe_video_info,
+    burn_ass_into_video,
     adapt_bilingual_ass_for_render,
     ass_escape_text,
     build_bilingual_ass_text,
@@ -52,7 +62,26 @@ Public transit shaped the city.
             build_bilingual_ass_text(self.source, self.chinese[:1])
 
     def test_ass_escapes_override_characters_and_line_breaks(self):
-        self.assertEqual(ass_escape_text("Use {x}\\path\nnext"), r"Use \{x\}\\path\Nnext")
+        self.assertEqual(
+            ass_escape_text("Use {x}\\path\nnext"),
+            "Use \\{x\\}\\\u2060path\\Nnext",
+        )
+
+    def test_ass_escape_keeps_literal_backslash_sequences_inert(self):
+        # libass reads "\\N" as a backslash followed by a line break, so a
+        # literal backslash must never be directly followed by an override letter.
+        escaped = ass_escape_text(r"C:\new \N \h")
+        self.assertNotRegex(escaped, r"\\[Nnh]")
+        self.assertEqual(escaped.replace("\u2060", ""), r"C:\new \N \h")
+
+    def test_render_layout_does_not_split_on_escaped_literal_backslash_n(self):
+        source = parse_srt_text("1\n00:00:01,000 --> 00:00:02,000\nsee \\N here\n")
+        chinese = parse_srt_text("1\n00:00:01,000 --> 00:00:02,000\n字面 \\N 保留\n")
+        editable = build_bilingual_ass_text(source, chinese)
+        output = adapt_bilingual_ass_for_render(editable, frame_width=1920, frame_height=1080)
+        dialogue = [line for line in output.splitlines() if line.startswith("Dialogue:")]
+        self.assertTrue(dialogue)
+        self.assertTrue(all("\\\u2060N" in line for line in dialogue))
 
     def test_render_layout_stacks_tracks_inside_detected_4_3_picture(self):
         editable = build_bilingual_ass_text(self.source, self.chinese)
@@ -129,3 +158,103 @@ Public transit shaped the city.
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestVideoProbe(unittest.TestCase):
+    def test_probe_reads_first_video_stream_when_audio_is_first(self):
+        # Real ffprobe lists every stream unless -select_streams narrows it,
+        # so an audio-first container used to fail geometry parsing.
+        def fake_ffprobe(command, **_kwargs):
+            if "-select_streams" in command:
+                streams = [{"width": 1280, "height": 720}]
+            else:
+                streams = [{}, {"width": 1280, "height": 720}]
+            payload = {"streams": streams, "format": {"duration": "12.5"}}
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
+
+        with (
+            patch("subflow.bilingual._ffprobe_path", return_value=Path("ffprobe")),
+            patch("subflow.bilingual.subprocess.run", side_effect=fake_ffprobe) as run,
+        ):
+            duration, geometry = _probe_video_info(Path("ffmpeg"), Path("audio-first.mkv"))
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-select_streams") + 1], "v:0")
+        self.assertEqual(duration, 12.5)
+        self.assertEqual((geometry.width, geometry.height), (1280, 720))
+
+
+    def test_probe_swaps_dimensions_for_quarter_turn_rotation(self):
+        def probe_payload(stream):
+            payload = {"streams": [stream], "format": {"duration": "3"}}
+
+            def fake_ffprobe(command, **_kwargs):
+                return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
+
+            return fake_ffprobe
+
+        cases = [
+            ({"width": 1920, "height": 1080, "side_data_list": [{"rotation": -90}]}, (1080, 1920)),
+            ({"width": 1920, "height": 1080, "tags": {"rotate": "270"}}, (1080, 1920)),
+            ({"width": 1920, "height": 1080, "side_data_list": [{"rotation": 180}]}, (1920, 1080)),
+            ({"width": 1920, "height": 1080}, (1920, 1080)),
+        ]
+        for stream, expected in cases:
+            with (
+                self.subTest(stream=stream),
+                patch("subflow.bilingual._ffprobe_path", return_value=Path("ffprobe")),
+                patch("subflow.bilingual.subprocess.run", side_effect=probe_payload(stream)),
+            ):
+                _duration, geometry = _probe_video_info(Path("ffmpeg"), Path("clip.mov"))
+                self.assertEqual((geometry.width, geometry.height), expected)
+
+
+class TestBurnProcessCleanup(unittest.TestCase):
+    def test_failing_progress_callback_kills_ffmpeg_and_removes_partial_output(self):
+        source = parse_srt_text("1\n00:00:01,000 --> 00:00:02,000\nHello\n")
+        chinese = parse_srt_text("1\n00:00:01,000 --> 00:00:02,000\n你好\n")
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value)
+            video = root / "input.mp4"
+            video.write_bytes(b"not really a video")
+            ass = root / "bilingual.ass"
+            ass.write_text(build_bilingual_ass_text(source, chinese), encoding="utf-8")
+            output = root / "out" / "result.mp4"
+            pid_file = root / "ffmpeg.pid"
+            fake_ffmpeg = root / "ffmpeg"
+            fake_ffmpeg.write_text(
+                "#!/bin/sh\n"
+                f"echo $$ > {pid_file}\n"
+                'for last; do :; done\n'
+                'echo partial > "$last"\n'
+                "echo out_time_us=5000000\n"
+                "sleep 30\n",
+                encoding="utf-8",
+            )
+            fake_ffmpeg.chmod(0o755)
+            geometry = _VideoGeometry(1920, 1080)
+
+            def failing_progress(stage, percent, _message):
+                if stage == "encoding" and percent > 3:
+                    raise RuntimeError("progress sink failed")
+
+            with (
+                patch("subflow.bilingual._ensure_fonts"),
+                patch("subflow.bilingual.find_ass_ffmpeg", return_value=fake_ffmpeg),
+                patch("subflow.bilingual._probe_video_info", return_value=(10.0, geometry)),
+                patch("subflow.bilingual._detect_active_picture", return_value=geometry),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "progress sink failed"):
+                    burn_ass_into_video(video, ass, output, progress=failing_progress)
+
+            self.assertFalse(output.exists())
+            pid = int(pid_file.read_text().strip())
+            deadline = time.monotonic() + 3
+            alive = True
+            while alive and time.monotonic() < deadline:
+                try:
+                    os.kill(pid, 0)
+                    time.sleep(0.05)
+                except ProcessLookupError:
+                    alive = False
+            self.assertFalse(alive)

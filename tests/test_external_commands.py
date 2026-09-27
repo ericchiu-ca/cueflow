@@ -1,3 +1,4 @@
+import json
 import subprocess
 import tempfile
 import unittest
@@ -35,12 +36,36 @@ class ExternalCommandTests(unittest.TestCase):
 
     def test_external_command_timeout_is_reported(self):
         with patch.object(
-            workflow.subprocess,
-            "run",
+            workflow,
+            "run_captured",
             side_effect=subprocess.TimeoutExpired(["yt-dlp"], 1),
         ):
             with self.assertRaisesRegex(RuntimeError, "timed out"):
                 workflow.run_command(["yt-dlp", "url"], timeout_seconds=1)
+
+
+    def test_auto_english_translation_of_non_english_video_is_ignored(self):
+        self.assertEqual(
+            workflow.pick_english_tracks([], ["fr-orig", "fr", "en", "de"]),
+            (None, None),
+        )
+        self.assertEqual(
+            workflow.pick_english_tracks([], ["en-orig", "en", "fr"]),
+            (None, "en-orig"),
+        )
+        self.assertEqual(workflow.pick_english_tracks(["en-US"], ["en"]), ("en-US", "en"))
+
+    def test_detect_english_subtitles_reads_structured_metadata(self):
+        info = {
+            "subtitles": {},
+            "automatic_captions": {"fr-orig": [], "fr": [], "en": []},
+        }
+        with (
+            patch.object(workflow, "ensure_command", return_value="yt-dlp"),
+            patch.object(workflow, "run_command", return_value=json.dumps(info)) as run,
+        ):
+            self.assertEqual(workflow.detect_english_subtitles("https://example.test/v"), (None, None))
+        self.assertIn("--dump-single-json", run.call_args.args[0])
 
 
 if __name__ == "__main__":

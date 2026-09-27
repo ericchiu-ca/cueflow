@@ -13,7 +13,7 @@ CueFlow 把视频或音频变成可追溯的字幕项目：本地转录、可选
 
 - **规模**：中型单机应用。仓库是一个 Python 包，但同时包含 CLI、本地 Web UI、ASR 编排、翻译、审校、排版、视频编码和测试。
 - **声明版本**：`0.4.0`，`pyproject.toml` 将成熟度标为 Alpha。当前公开 Git 历史从经过审查的代码快照开始，且没有 tag；更早的版本演进、正式发布日期和发布边界无法从本仓库确认。
-- **平台**：主要面向 Apple Silicon macOS。`pyproject.toml` 声明 Python `>=3.11`；CI 只覆盖 Python 3.11 和 3.13，建议本地优先使用 3.11。
+- **平台**：主要面向 Apple Silicon macOS。`pyproject.toml` 声明 Python `>=3.11`；CI 覆盖 Python 3.11、3.12 和 3.13，建议本地优先使用 3.11。
 - **运行方式**：本地 CLI 或仅绑定回环地址的本地网页；不是多用户服务，不得通过反向代理或公网隧道暴露。
 - **数据边界**：视频、音频、ASR、WhisperX、ASS 和 FFmpeg 编码留在本机。主动使用 Codex 翻译时，请求包含字幕文本、稳定 ID、起止时间、源语言和所选模型；不会上传视频或音频。
 - **验证状态**：当前公开基线在 Python 3.11 和 3.12 上各有 51/51 项单元测试通过；wheel 可在 Python 3.11 构建。仓库所有者已确认完成真实媒体的 ASR、翻译、烧录、清理和 Apple VideoToolbox 人工验收，但详细证据尚未进入 Git。详见 [测试指南](docs/TESTING.md)。

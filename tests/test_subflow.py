@@ -9,6 +9,7 @@ from subflow.core import (
     SubtitleSegment,
     build_bilingual_srt_text,
     build_srt_text,
+    parse_srt_file,
     parse_srt_text,
     parse_translation_file,
     save_master_json,
@@ -43,6 +44,23 @@ But the labor market remains surprisingly strong.
         self.assertEqual(segments[0].start, 10.0)
         self.assertEqual(segments[0].end, 13.5)
         self.assertEqual(segments[1].id, "0002")
+
+    def test_parse_srt_keeps_first_cue_after_utf8_bom(self):
+        sample = "﻿1\n00:00:01,000 --> 00:00:02,000\nFirst\n\n2\n00:00:03,000 --> 00:00:04,000\nSecond\n"
+        segments = parse_srt_text(sample)
+        self.assertEqual([segment.text for segment in segments], ["First", "Second"])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "bom.srt"
+            path.write_bytes(sample.encode("utf-8"))
+            self.assertEqual(len(parse_srt_file(path)), 2)
+
+    def test_parse_srt_preserves_millisecond_timing_round_trip(self):
+        sample = "1\n00:00:01,234 --> 00:00:02,567\nPrecise\n\n2\n00:00:03,001 --> 00:00:03,004\nShort\n"
+        segments = parse_srt_text(sample)
+        self.assertEqual([(s.start, s.end) for s in segments], [(1.234, 2.567), (3.001, 3.004)])
+        self.assertIn("00:00:01,234 --> 00:00:02,567", build_srt_text(segments))
+        self.assertIn("00:00:03,001 --> 00:00:03,004", build_srt_text(segments))
 
 
 class TestSrtOutput(unittest.TestCase):
@@ -95,6 +113,15 @@ class TestQCMetrics(unittest.TestCase):
         self.assertIn("SHORT_SEGMENT", codes)
         self.assertIn("EMPTY_TRANSLATION", codes)
         self.assertIn("LONG_CHINESE_SEGMENT", codes)
+
+
+    def test_qc_accepts_ids_beyond_9999_segments(self):
+        segments = [
+            SubtitleSegment(f"{index:04d}", index * 2.0, index * 2.0 + 1.5, "line", [])
+            for index in range(1, 10002)
+        ]
+        codes = {issue.code for issue in run_qc(segments)}
+        self.assertNotIn("INVALID_ID", codes)
 
 
 class TestTranslationParser(unittest.TestCase):
@@ -152,7 +179,7 @@ class TestLocalTranscription(unittest.TestCase):
             }
         )
         self.assertEqual(segments[0].id, "0001")
-        self.assertEqual(segments[0].start, 1.23)
+        self.assertEqual(segments[0].start, 1.234)
         self.assertEqual(segments[0].text, "Bonjour Montreal.")
         self.assertEqual(segments[0].words[0]["probability"], 0.98)
 
@@ -304,3 +331,69 @@ class TestLocalTranscription(unittest.TestCase):
             self.assertEqual(metadata["model_path"], "turbo")
             self.assertEqual(metadata["large_v3_model_path"], "large-v3")
             self.assertNotIn(str(legacy_home), aligned_text)
+
+    def test_mixed_language_project_realigns_per_window_language(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            project = Path(temp_value) / "project"
+            project.mkdir()
+            (project / "talk.mp4").write_bytes(b"source")
+            segments = [
+                SubtitleSegment("0001", 0.0, 2.0, "Hello there", []),
+                SubtitleSegment("0002", 2.0, 4.0, "Bonjour à tous", []),
+            ]
+            save_master_json(
+                project / "master.json",
+                segments,
+                metadata={
+                    "source": "talk.mp4",
+                    "language": "mixed",
+                    "confidence_windows": [
+                        {"start": 0.0, "end": 2.0, "language": "en", "segment_ids": ["0001"]},
+                        {"start": 2.0, "end": 4.0, "language": "fr", "segment_ids": ["0002"]},
+                    ],
+                    "quality_issues": [
+                        {"start": 2.5, "end": 3.0, "id": "0009", "segment_ids": ["0009"]}
+                    ],
+                },
+            )
+            # WhisperX splits the French cue in two, shifting later IDs.
+            def fake_alignment(_wav, subset, *, language, **_kwargs):
+                if language == "fr":
+                    return [
+                        SubtitleSegment("", 2.0, 2.8, "Bonjour", []),
+                        SubtitleSegment("", 2.8, 4.0, "à tous", []),
+                    ]
+                return list(subset)
+
+            with (
+                patch("subflow.transcription._run_ffmpeg"),
+                patch(
+                    "subflow.transcription._run_whisperx_alignment",
+                    side_effect=fake_alignment,
+                ) as alignment,
+                patch("subflow.transcription.find_whisperx_python", return_value=Path("/mock/python")),
+                patch("subflow.transcription.whisperx_version", return_value="3.8.6"),
+            ):
+                artifact = align_existing_project(project)
+
+            self.assertEqual(
+                sorted(call.kwargs["language"] for call in alignment.call_args_list),
+                ["en", "fr"],
+            )
+            metadata = json.loads(artifact.master_path.read_text(encoding="utf-8"))["metadata"]
+            self.assertEqual(metadata["alignment"], "whisperx-mixed")
+            self.assertEqual(metadata["confidence_windows"][1]["segment_ids"], ["0002", "0003"])
+            self.assertEqual(metadata["quality_issues"][0]["segment_ids"], ["0002", "0003"])
+
+    def test_mixed_language_realign_without_windows_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            project = Path(temp_value) / "project"
+            project.mkdir()
+            (project / "talk.mp4").write_bytes(b"source")
+            save_master_json(
+                project / "master.json",
+                [SubtitleSegment("0001", 0.0, 1.0, "Hello", [])],
+                metadata={"source": "talk.mp4", "language": "mixed"},
+            )
+            with self.assertRaisesRegex(TranscriptionError, "per-window language"):
+                align_existing_project(project)

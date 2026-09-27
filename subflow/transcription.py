@@ -18,6 +18,7 @@ from .core import (
     normalize_segments,
     save_master_json,
 )
+from .proc import run_captured
 
 
 FRAMELEDGER_ROOT = Path.home() / "Documents" / "FrameLedger"
@@ -231,10 +232,27 @@ def _ffmpeg_subprocess_env() -> dict[str, str]:
     return environment
 
 
+FFMPEG_EXTRACT_TIMEOUT_SECONDS = 3 * 3600
+FFMPEG_CLIP_TIMEOUT_SECONDS = 600
+
+
+def _run_ffmpeg_checked(command: list[str], *, timeout: float, what: str) -> None:
+    try:
+        completed = run_captured(command, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise TranscriptionError(f"ffmpeg timed out after {timeout:.0f}s while trying to {what}") from error
+    except OSError as error:
+        raise TranscriptionError(f"ffmpeg could not start: {error}") from error
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()[-2000:]
+        raise TranscriptionError(f"ffmpeg could not {what}: {detail}")
+
+
 def _run_ffmpeg(source: Path, wav_path: Path) -> None:
-    completed = subprocess.run(
+    _run_ffmpeg_checked(
         [
             _ensure_ffmpeg(),
+            "-nostdin",
             "-hide_banner",
             "-loglevel",
             "error",
@@ -250,13 +268,9 @@ def _run_ffmpeg(source: Path, wav_path: Path) -> None:
             "pcm_s16le",
             str(wav_path),
         ],
-        capture_output=True,
-        text=True,
-        check=False,
+        timeout=FFMPEG_EXTRACT_TIMEOUT_SECONDS,
+        what="extract audio",
     )
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout).strip()[-2000:]
-        raise TranscriptionError(f"ffmpeg could not extract audio: {detail}")
 
 
 def _run_ffmpeg_clip(
@@ -266,9 +280,10 @@ def _run_ffmpeg_clip(
     start: float,
     end: float,
 ) -> None:
-    completed = subprocess.run(
+    _run_ffmpeg_checked(
         [
             _ensure_ffmpeg(),
+            "-nostdin",
             "-hide_banner",
             "-loglevel",
             "error",
@@ -287,13 +302,9 @@ def _run_ffmpeg_clip(
             "pcm_s16le",
             str(wav_path),
         ],
-        capture_output=True,
-        text=True,
-        check=False,
+        timeout=FFMPEG_CLIP_TIMEOUT_SECONDS,
+        what="extract retry clip",
     )
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout).strip()[-2000:]
-        raise TranscriptionError(f"ffmpeg could not extract retry clip: {detail}")
 
 
 def _normalize_words(raw_words: object) -> list[dict]:
@@ -568,7 +579,8 @@ def transcribe_with_mlx(
             if language == "mixed":
                 raise TranscriptionError(f"Mixed-language VAD cascade failed: {error}") from error
             cascade_warning = (
-                "VAD/large-v3 cascade failed; used full-file Turbo fallback"
+                "VAD/large-v3 cascade failed; used full-file Turbo fallback: "
+                + str(error)[:300]
             )
     else:
         missing: list[str] = []
@@ -594,12 +606,9 @@ def transcribe_with_mlx(
         "decoding_profile": decoding_profile,
     }
     try:
-        completed = subprocess.run(
+        completed = run_captured(
             [str(helper_path)],
             input=json.dumps(request, ensure_ascii=False),
-            capture_output=True,
-            text=True,
-            check=False,
             env=_ffmpeg_subprocess_env(),
             timeout=timeout_seconds,
         )
@@ -902,13 +911,10 @@ def _run_whisperx_alignment(
         ],
     }
     try:
-        completed = subprocess.run(
+        completed = run_captured(
             [str(python_path), "-m", "subflow.whisperx_runner"],
             input=json.dumps(request, ensure_ascii=False),
-            capture_output=True,
-            text=True,
-            check=False,
-            cwd=str(project_root),
+            cwd=project_root,
             env=_ffmpeg_subprocess_env(),
             timeout=timeout_seconds,
         )
@@ -1214,6 +1220,14 @@ def align_existing_project(
     segments = load_master_json(master_path)
     if not segments:
         raise TranscriptionError("master.json contains no subtitle segments")
+    confidence_windows = metadata.get("confidence_windows")
+    if not isinstance(confidence_windows, list):
+        confidence_windows = []
+    if whisper_language == "mixed" and not confidence_windows:
+        raise TranscriptionError(
+            "This mixed-language project has no per-window language metadata; "
+            "realign it with language en or fr-CA instead."
+        )
     python_path = find_whisperx_python(whisperx_python)
     version = whisperx_version(python_path)
     if python_path is None or version is None:
@@ -1228,13 +1242,23 @@ def align_existing_project(
         update("audio", 20, "正在为现有字幕提取音频")
         _run_ffmpeg(source, wav_path)
         update("aligning", 55, "正在使用 WhisperX 重新对齐现有字幕")
-        aligned = _run_whisperx_alignment(
-            wav_path,
-            segments,
-            language=whisper_language,
-            python_path=python_path,
-            cache_dir=Path(__file__).resolve().parents[1] / ".cache" / "whisperx",
-        )
+        cache_dir = Path(__file__).resolve().parents[1] / ".cache" / "whisperx"
+        if whisper_language == "mixed":
+            aligned = _run_mixed_whisperx_alignment(
+                wav_path,
+                segments,
+                confidence_windows,
+                python_path=python_path,
+                cache_dir=cache_dir,
+            )
+        else:
+            aligned = _run_whisperx_alignment(
+                wav_path,
+                segments,
+                language=whisper_language,
+                python_path=python_path,
+                cache_dir=cache_dir,
+            )
         update("writing", 92, "正在写入独立的 WhisperX 产物")
         aligned_master = project / "master.whisperx.json"
         output_dir = project / "output"
@@ -1246,9 +1270,28 @@ def align_existing_project(
                 aligned_metadata[key] = _portable_model_reference(
                     str(aligned_metadata[key])
                 )
+        # WhisperX re-splits segments, so IDs from the old timeline are stale.
+        if confidence_windows:
+            aligned_metadata["confidence_windows"] = _attach_confidence_window_ids(
+                confidence_windows, aligned
+            )
+        if isinstance(metadata.get("quality_issues"), list):
+            timed_issues = [
+                {
+                    key: value
+                    for key, value in issue.items()
+                    if key not in {"id", "segment_ids"}
+                    or not isinstance(issue.get("start"), (int, float))
+                }
+                for issue in metadata["quality_issues"]
+                if isinstance(issue, dict)
+            ]
+            aligned_metadata["quality_issues"] = _attach_quality_issue_ids(
+                timed_issues, aligned
+            )
         aligned_metadata.update(
             {
-                "alignment": "whisperx",
+                "alignment": "whisperx-mixed" if whisper_language == "mixed" else "whisperx",
                 "whisperx_version": version,
                 "derived_from": master_path.name,
                 "warnings": [],

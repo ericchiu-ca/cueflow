@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 15
     strategy:
       matrix:
-        python-version: ["3.11", "3.13"]
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -27,3 +27,11 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Build wheel
         run: python -m pip wheel . --no-deps -w dist
+      - name: Smoke-test the installed wheel outside the checkout
+        # The editable install above cannot catch missing package data.
+        run: |
+          python -m venv "$RUNNER_TEMP/wheel-venv"
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install dist/cueflow_subtitles-*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/wheel-venv/bin/python" -c "from subflow.translation import TRANSLATION_SCHEMA; from subflow.web import STATIC_FILE; assert TRANSLATION_SCHEMA.is_file(), TRANSLATION_SCHEMA; assert STATIC_FILE.is_file(), STATIC_FILE"
+          "$RUNNER_TEMP/wheel-venv/bin/cueflow" --help > /dev/null

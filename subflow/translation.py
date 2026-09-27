@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from .core import build_srt_text
+from .proc import run_captured
 
 
 CODEX_MODEL_CHOICES = (
@@ -268,17 +269,17 @@ class CodexCLITranslationProvider(TranslationProvider):
             )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Never let a previous run's result stand in for this one: IDs are only
+        # 0001..N, so a stale file with the same cue count would pass validation.
+        output_path.unlink(missing_ok=True)
         if progress:
             progress(30, "Codex is translating subtitle text with structured output...")
         try:
             with tempfile.TemporaryDirectory(prefix="cueflow-codex-") as temp_dir:
-                result = subprocess.run(
+                result = run_captured(
                     self.build_command(request, output_path),
                     input=build_translation_prompt(request),
                     cwd=temp_dir,
-                    capture_output=True,
-                    text=True,
-                    check=False,
                     timeout=self.timeout_seconds,
                 )
         except subprocess.TimeoutExpired as error:

@@ -1,6 +1,7 @@
 import http.client
 import json
 import os
+import shutil
 import tempfile
 import threading
 import unittest
@@ -153,6 +154,150 @@ class WebSecurityTests(unittest.TestCase):
             finally:
                 server.shutdown()
                 server.server_close()
+                manager.executor.shutdown(wait=True, cancel_futures=True)
+
+
+class ServerFixture:
+    def __init__(self, root: Path) -> None:
+        self.manager = make_manager(root)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CueFlowHandler)
+        self.server.manager = self.manager
+        self.server.max_upload_bytes = 1024 * 1024
+        self.server.csrf_token = "test-token"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def get(self, path: str) -> tuple[int, bytes]:
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
+        try:
+            connection.request("GET", path)
+            response = connection.getresponse()
+            return response.status, response.read()
+        finally:
+            connection.close()
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.manager.executor.shutdown(wait=True, cancel_futures=True)
+
+
+class WebRobustnessTests(unittest.TestCase):
+    def test_download_route_requires_matching_job_kind(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            fixture = ServerFixture(Path(temp_value) / "output")
+            try:
+                srt = Path(temp_value) / "result.srt"
+                srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nHi\n", encoding="utf-8")
+                fixture.manager.jobs["abc"] = {
+                    "id": "abc",
+                    "kind": "transcription",
+                    "status": "complete",
+                    "output_path": str(srt),
+                    "download_name": "result.srt",
+                }
+                # Previously raised KeyError and closed the socket without a response.
+                status, _ = fixture.get("/api/translate/abc/download?format=ids")
+                self.assertEqual(status, 404)
+                status, _ = fixture.get("/api/burn/abc/download")
+                self.assertEqual(status, 404)
+                status, body = fixture.get("/api/jobs/abc/download")
+                self.assertEqual(status, 200)
+                self.assertIn(b"Hi", body)
+            finally:
+                fixture.close()
+
+    def test_responses_forbid_framing(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            fixture = ServerFixture(Path(temp_value) / "output")
+            try:
+                for path in ("/", "/api/does-not-exist"):
+                    connection = http.client.HTTPConnection(
+                        "127.0.0.1", fixture.server.server_address[1], timeout=5
+                    )
+                    connection.request("GET", path)
+                    response = connection.getresponse()
+                    response.read()
+                    self.assertEqual(response.getheader("X-Frame-Options"), "DENY")
+                    self.assertIn("frame-ancestors 'none'", response.getheader("Content-Security-Policy"))
+                    self.assertEqual(response.getheader("X-Content-Type-Options"), "nosniff")
+                    connection.close()
+            finally:
+                fixture.close()
+
+    def test_unexpected_get_error_returns_json_500(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            fixture = ServerFixture(Path(temp_value) / "output")
+            try:
+                with patch.object(fixture.manager, "environment", side_effect=KeyError("boom")):
+                    status, body = fixture.get("/api/environment")
+                self.assertEqual(status, 500)
+                self.assertIn("error", json.loads(body))
+            finally:
+                fixture.close()
+
+    def test_save_review_validates_every_track_before_writing(self):
+        source_srt = "1\n00:00:00,000 --> 00:00:01,000\nHello\n"
+        chinese_srt = "1\n00:00:00,000 --> 00:00:01,000\n你好\n"
+        with tempfile.TemporaryDirectory() as temp_value:
+            manager = make_manager(Path(temp_value) / "output")
+            try:
+                review = manager.create_review("source.srt", source_srt, "zh.srt", chinese_srt)
+                project = Path(review["project"])
+                tracks = {
+                    "source": review["tracks"]["source"]["segments"],
+                    "chinese": "not a segment list",
+                }
+                with self.assertRaisesRegex(ValueError, "segment list"):
+                    manager.save_review(review["id"], tracks)
+                self.assertFalse((project / "output" / "reviewed.source.srt").exists())
+                self.assertFalse((project / "master.reviewed.source.json").exists())
+
+                tracks["chinese"] = review["tracks"]["chinese"]["segments"]
+                saved = manager.save_review(review["id"], tracks)
+                self.assertTrue((project / "output" / "reviewed.source.srt").is_file())
+                self.assertTrue((project / "output" / "reviewed.zh.srt").is_file())
+                self.assertEqual(saved["pairing"]["matched"], True)
+            finally:
+                manager.executor.shutdown(wait=True, cancel_futures=True)
+
+    def test_cleanup_and_in_flight_writes_exclude_each_other(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value) / "output"
+            manager = make_manager(root)
+            try:
+                (root / "reviews" / "job").mkdir(parents=True)
+                with manager.operation():
+                    with self.assertRaisesRegex(ValueError, "still writing"):
+                        manager.cleanup_local_files()
+                self.assertTrue((root / "reviews" / "job").is_dir())
+
+                started = threading.Event()
+                release = threading.Event()
+                original_rmtree = shutil.rmtree
+
+                def slow_rmtree(path, *args, **kwargs):
+                    started.set()
+                    release.wait(5)
+                    return original_rmtree(path, *args, **kwargs)
+
+                with patch("subflow.web.shutil.rmtree", side_effect=slow_rmtree):
+                    worker = threading.Thread(target=manager.cleanup_local_files)
+                    worker.start()
+                    self.assertTrue(started.wait(5))
+                    # Status polling must not block on the deletion...
+                    self.assertIsNone(manager.snapshot("missing"))
+                    # ...and new writers are refused until it finishes.
+                    with self.assertRaisesRegex(ValueError, "being cleaned up"):
+                        with manager.operation():
+                            pass
+                    release.set()
+                    worker.join(5)
+
+                self.assertFalse((root / "reviews").exists())
+                with manager.operation():
+                    pass
+            finally:
                 manager.executor.shutdown(wait=True, cancel_futures=True)
 
 

@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Dict, List
 
-from .core import SubtitleSegment
+from .core import STABLE_ID_RE, SubtitleSegment
 
 
 @dataclass
@@ -42,7 +42,7 @@ def run_qc(
                 break
             seen.add(seg_id)
 
-    invalid_ids = [seg_id for seg_id in ids if not re.fullmatch(r"\d{4}", seg_id)]
+    invalid_ids = [seg_id for seg_id in ids if not STABLE_ID_RE.fullmatch(seg_id)]
     if invalid_ids:
         issues.append(QCIssue("ERROR", "INVALID_ID", f"Invalid segment IDs: {', '.join(invalid_ids[:5])}"))
 
