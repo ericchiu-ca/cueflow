@@ -51,6 +51,7 @@
 - YouTube 字幕检测改用 yt-dlp 的结构化 JSON；原先按 `--list-subs` 文本匹配 "automatic subtitles"，而 yt-dlp 实际输出 "automatic captions"，导致自动字幕被当成人工字幕。自动字幕只接受原始语音轨（`en-orig`），不再把非英语视频的机器翻译当作英文原文。
 - Web 响应增加 `X-Frame-Options: DENY`、`frame-ancestors 'none'`、`nosniff` 和 `no-referrer`，防止页面被第三方网站嵌入做点击劫持。
 - QC 与审校共用稳定 ID 规则（4 位以上数字）；超过 9999 条字幕时 QC 不再误报 `INVALID_ID`。
+- ASR worker 超时按音频时长计算（启动 600 s + VAD 2×、Turbo 3×、large-v3 8× 音频时长），不再固定 8 小时；MLX 批处理每完成一个语音窗就写入检查点（按片段音频内容、模型和语言作键），worker 崩溃或超时后自动续跑一次，只处理未完成的片段；同一项目目录重跑也会复用，级联成功后删除检查点。
 - 分批翻译可以断点续跑：每批校验通过后写入带输入指纹（ID、原文、源语言、模型、provider）的检查点，重跑时只复用指纹一致的批次；CLI 对同一输出目录重跑会自动续跑，Web 对失败的翻译任务提供“重试”按钮（`POST /api/translate/<id>/retry`）。Codex 未安装或未登录等配置错误不再被当作批次失败重试。
 - 烧录时若中英事件无法一一配对，仍按原 ASS 渲染，但会在进度与结果中给出警告，不再静默回退；渲染布局读取 ASS 中 `Chinese` / `Source` 样式的字体、字号、颜色和描边，用户在 Aegisub 等工具中的样式修改会生效。
 - QC 一次列出全部重复 ID；中文过长提示显示实际计数（不含空白）和上限。

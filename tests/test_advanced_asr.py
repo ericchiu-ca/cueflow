@@ -361,19 +361,83 @@ class TestAdvancedAsr(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaises(RuntimeError) as caught:
-                _run_json_worker(Path(sys.executable), failing, {"protocol": "p1"}, {})
+                _run_json_worker(Path(sys.executable), failing, {"protocol": "p1"}, {}, timeout=30)
             self.assertTrue(str(caught.exception).endswith("ValueError: bad weights"))
             self.assertNotIn("torch warning", str(caught.exception))
 
             wrong = Path(directory) / "wrong_worker.py"
             wrong.write_text("import json, sys\njson.dump({'protocol': 'other'}, sys.stdout)\n", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "expected 'p1'"):
-                _run_json_worker(Path(sys.executable), wrong, {"protocol": "p1"}, {})
+                _run_json_worker(Path(sys.executable), wrong, {"protocol": "p1"}, {}, timeout=30)
 
             listing = Path(directory) / "list_worker.py"
             listing.write_text("import json, sys\njson.dump([1, 2], sys.stdout)\n", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "non-object"):
-                _run_json_worker(Path(sys.executable), listing, {"protocol": "p1"}, {})
+                _run_json_worker(Path(sys.executable), listing, {"protocol": "p1"}, {}, timeout=30)
+
+    def test_crashed_batch_worker_resumes_from_its_checkpoint(self):
+        import os
+        import sys
+        import wave
+
+        from subflow.advanced_asr import _batch_results
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "model").mkdir()
+            fake = root / "fake_modules"
+            fake.mkdir()
+            log = root / "calls.log"
+            crashed = root / "crashed.marker"
+            (fake / "mlx_whisper.py").write_text(
+                "import os\n"
+                f"LOG = {str(log)!r}\nMARK = {str(crashed)!r}\n"
+                "def transcribe(path, **kwargs):\n"
+                "    open(LOG, 'a').write(os.path.basename(path) + '\\n')\n"
+                "    if path.endswith('clip-3.wav') and not os.path.exists(MARK):\n"
+                "        open(MARK, 'w').close()\n"
+                "        os._exit(9)  # hard crash mid-batch\n"
+                "    return {'text': os.path.basename(path), 'segments': []}\n",
+                encoding="utf-8",
+            )
+            items = []
+            for index in range(1, 5):
+                clip = root / f"clip-{index}.wav"
+                with wave.open(str(clip), "wb") as audio:
+                    audio.setnchannels(1)
+                    audio.setsampwidth(2)
+                    audio.setframerate(16000)
+                    audio.writeframes(bytes([index]) * 3200)  # distinct content per clip
+                items.append({"id": str(index), "audio_path": str(clip), "language": "en"})
+
+            environment = dict(os.environ, PYTHONPATH=str(fake))
+            checkpoint = root / "ckpt" / "turbo.jsonl"
+            results = _batch_results(
+                Path(sys.executable), root / "model", items, environment, checkpoint=checkpoint
+            )
+
+            self.assertEqual({key: value["result"]["text"] for key, value in results.items()},
+                             {str(i): f"clip-{i}.wav" for i in range(1, 5)})
+            calls = log.read_text().split()
+            # clips 1-2 finished before the crash and were not transcribed again
+            self.assertEqual(calls, ["clip-1.wav", "clip-2.wav", "clip-3.wav", "clip-3.wav", "clip-4.wav"])
+
+            # A later run over the same audio reuses everything without a worker.
+            log.unlink()
+            again = _batch_results(Path("/nonexistent/python"), root / "model", items, environment, checkpoint=checkpoint)
+            self.assertEqual(len(again), 4)
+            self.assertFalse(log.exists())
+
+    def test_worker_timeout_is_reported_as_runtime_error(self):
+        import sys
+
+        from subflow.advanced_asr import _run_json_worker
+
+        with tempfile.TemporaryDirectory() as directory:
+            slow = Path(directory) / "slow_worker.py"
+            slow.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "timed out after 1 s"):
+                _run_json_worker(Path(sys.executable), slow, {}, {}, timeout=1)
 
     def test_whisperx_chunk_dicts_are_converted_to_spans(self):
         self.assertEqual(
