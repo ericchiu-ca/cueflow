@@ -407,6 +407,241 @@ def _candidate_problem_count(candidate: dict) -> int:
     )
 
 
+def _escalation_reasons(
+    turbo_candidates: list[dict], language: str
+) -> tuple[dict[int, list[str]], dict[int, str]]:
+    """Why each Turbo window should be retried with large-v3 (if at all)."""
+    retry_reasons: dict[int, list[str]] = {}
+    neighbor_consensus: dict[int, str] = {}
+    for index, candidate in enumerate(turbo_candidates):
+        reasons: list[str] = []
+        if candidate["error"]:
+            reasons.append("worker_error")
+        if candidate["score"] < 80:
+            reasons.append("low_confidence")
+        if candidate["quality_issues"]:
+            reasons.append("quality_gate")
+        if candidate["text_anomalies"]:
+            reasons.extend(candidate["text_anomalies"])
+        if language == "mixed":
+            if candidate["language"] not in {"en", "fr"}:
+                reasons.append("unsupported_language")
+            if candidate["language_conflict"]:
+                reasons.append("language_conflict")
+            previous = turbo_candidates[index - 1]["language"] if index > 0 else None
+            following = (
+                turbo_candidates[index + 1]["language"]
+                if index + 1 < len(turbo_candidates)
+                else None
+            )
+            if (
+                previous in {"en", "fr"}
+                and previous == following
+                and candidate["language"] != previous
+            ):
+                reasons.append("isolated_language")
+                neighbor_consensus[index] = previous
+        if reasons:
+            retry_reasons[index] = list(dict.fromkeys(reasons))
+    return retry_reasons, neighbor_consensus
+
+
+def _retry_languages_for(
+    index: int,
+    candidate: dict,
+    reasons: list[str],
+    neighbor_consensus: dict[int, str],
+    *,
+    language: str,
+    requested_language: str,
+) -> list[str]:
+    languages = [requested_language]
+    if language == "mixed":
+        primary = (
+            candidate["text_language"]
+            if candidate["text_language"] in {"en", "fr"}
+            else candidate["language"]
+            if candidate["language"] in {"en", "fr"}
+            else "auto"
+        )
+        languages = [primary]
+        if "isolated_language" in reasons:
+            languages.append(neighbor_consensus[index])
+        elif index in neighbor_consensus and (
+            candidate["text_anomalies"] or candidate["language"] not in {"en", "fr"}
+        ):
+            languages = [neighbor_consensus[index]]
+    return list(dict.fromkeys(languages))
+
+
+def _select_candidate(turbo: dict, large: dict | None) -> tuple[dict, str]:
+    if large and not large["error"]:
+        if turbo["error"] or large["score"] > turbo["score"] or (
+            large["score"] == turbo["score"]
+            and _candidate_problem_count(large) < _candidate_problem_count(turbo)
+        ):
+            return large, "large-v3"
+    return turbo, "turbo"
+
+
+def _window_issue(
+    window: dict,
+    severity: str,
+    code: str,
+    message: str,
+    key_suffix: str,
+    text: str | None = None,
+) -> dict:
+    issue = {
+        "severity": severity,
+        "code": code,
+        "message": message,
+        "start": float(window["start"]),
+        "end": float(window["end"]),
+    }
+    if text is not None:
+        issue["text"] = text
+    issue["window_key"] = f"vad:{window['index']}:{key_suffix}"
+    return issue
+
+
+def _window_issues(
+    window: dict, selected: dict, similarity: float | None, language: str
+) -> list[dict]:
+    issues: list[dict] = []
+    score = int(selected["score"])
+    tier = _tier(score)
+    text = selected["text"]
+    if selected["error"]:
+        issues.append(
+            _window_issue(
+                window, "ERROR", "ASR_WINDOW_FAILED", f"语音窗识别失败：{selected['error']}", "failed"
+            )
+        )
+    elif tier != "high":
+        issues.append(
+            _window_issue(
+                window,
+                "ERROR" if tier == "low" else "WARN",
+                "ASR_LOW_CONFIDENCE" if tier == "low" else "ASR_MEDIUM_CONFIDENCE",
+                f"该语音窗转录置信度为 {score}/100（{tier}），建议人工复核。",
+                "confidence",
+                text,
+            )
+        )
+    if selected["language_conflict"]:
+        issues.append(
+            _window_issue(
+                window,
+                "WARN",
+                "ASR_LANGUAGE_CONFLICT",
+                f"Whisper 检测为 {selected['language']}，但文本证据支持 "
+                f"{selected['text_language']}，建议人工复核。",
+                "language-conflict",
+                text,
+            )
+        )
+    if "unspaced_text" in selected["text_anomalies"]:
+        issues.append(
+            _window_issue(
+                window, "WARN", "ASR_UNSPACED_TEXT", "检测到异常长的无空格文本，建议人工复核。",
+                "unspaced-text", text,
+            )
+        )
+    if similarity is not None and similarity < 0.6:
+        issues.append(
+            _window_issue(
+                window,
+                "WARN",
+                "ASR_MODEL_DISAGREEMENT",
+                f"Turbo 与 large-v3 文本差异较大（相似度 {similarity:.2f}），建议人工复核。",
+                "model-disagreement",
+                text,
+            )
+        )
+    if language == "mixed" and selected["language"] not in {"en", "fr"}:
+        issues.append(
+            _window_issue(
+                window, "WARN", "ASR_UNSUPPORTED_LANGUAGE",
+                f"检测到非英语/法语语音：{selected['language']}。", "language", text,
+            )
+        )
+    return issues
+
+
+def _confidence_window(
+    window: dict,
+    *,
+    selected: dict,
+    selected_model: str,
+    turbo: dict,
+    large: dict | None,
+    similarity: float | None,
+    reasons: list[str],
+    languages: list[str],
+) -> dict:
+    score = int(selected["score"])
+    return {
+        "window": int(window["index"]),
+        "start": round(float(window["start"]), 3),
+        "end": round(float(window["end"]), 3),
+        "language": selected["language"],
+        "text_language": selected["text_language"],
+        "text_language_confidence": selected["text_language_confidence"],
+        "language_conflict": selected["language_conflict"],
+        "text_anomalies": selected["text_anomalies"],
+        "model": selected_model,
+        "score": score,
+        "tier": _tier(score),
+        "turbo_score": int(turbo["score"]),
+        "large_v3_score": int(large["score"]) if large else None,
+        "model_similarity": round(similarity, 3) if similarity is not None else None,
+        "retry_reasons": reasons,
+        "retry_languages": languages,
+        "retry_language": (
+            large.get("retry_language")
+            if large and selected_model == "large-v3"
+            else languages[0]
+            if len(languages) == 1
+            else None
+        ),
+        "metrics": {
+            key: round(value, 4) if isinstance(value, float) else value
+            for key, value in selected["metrics"].items()
+        },
+    }
+
+
+def _cascade_summary(
+    confidence_windows: list[dict],
+    retry_reasons: dict[int, list[str]],
+    *,
+    large_attempts: int,
+    large_selected: int,
+    language_counts: dict[str, int],
+) -> dict:
+    tiers = {"high": 0, "medium": 0, "low": 0}
+    for window in confidence_windows:
+        tiers[window["tier"]] += 1
+    return {
+        "total_windows": len(confidence_windows),
+        "high": tiers["high"],
+        "medium": tiers["medium"],
+        "low": tiers["low"],
+        "large_v3_escalated": len(retry_reasons),
+        "large_v3_attempts": large_attempts,
+        "large_v3_selected": large_selected,
+        "languages": language_counts,
+        "language_rechecks": sum(
+            bool({"language_conflict", "isolated_language"} & set(reasons))
+            for reasons in retry_reasons.values()
+        ),
+        "unspaced_rechecks": sum(
+            "unspaced_text" in reasons for reasons in retry_reasons.values()
+        ),
+    }
+
+
 def transcribe_vad_cascade(
     *,
     wav_path: Path,
@@ -420,6 +655,7 @@ def transcribe_vad_cascade(
     quality_analyzer: Callable,
     environment_factory: Callable[[], dict[str, str]],
 ) -> AdvancedAsrResult:
+    """VAD windows -> Turbo -> large-v3 for weak windows -> best candidate each."""
     if language not in {"en", "fr", "mixed"}:
         raise RuntimeError(f"Unsupported advanced ASR language: {language}")
     worker_python = _helper_python(helper_path)
@@ -449,11 +685,7 @@ def transcribe_vad_cascade(
     try:
         clips = _write_clips(wav_path, windows, temp_dir)
         turbo_items = [
-            {
-                "id": str(window["index"]),
-                "audio_path": str(clip),
-                "language": requested_language,
-            }
+            {"id": str(window["index"]), "audio_path": str(clip), "language": requested_language}
             for window, clip in zip(windows, clips)
         ]
         turbo_output = _batch_results(worker_python, turbo_model, turbo_items, environment)
@@ -467,71 +699,28 @@ def transcribe_vad_cascade(
             )
             for window in windows
         ]
-        retry_reasons: dict[int, list[str]] = {}
-        neighbor_consensus: dict[int, str] = {}
-        for index, candidate in enumerate(turbo_candidates):
-            reasons: list[str] = []
-            if candidate["error"]:
-                reasons.append("worker_error")
-            if candidate["score"] < 80:
-                reasons.append("low_confidence")
-            if candidate["quality_issues"]:
-                reasons.append("quality_gate")
-            if candidate["text_anomalies"]:
-                reasons.extend(candidate["text_anomalies"])
-            if language == "mixed":
-                if candidate["language"] not in {"en", "fr"}:
-                    reasons.append("unsupported_language")
-                if candidate["language_conflict"]:
-                    reasons.append("language_conflict")
-                previous = turbo_candidates[index - 1]["language"] if index > 0 else None
-                following = (
-                    turbo_candidates[index + 1]["language"]
-                    if index + 1 < len(turbo_candidates)
-                    else None
-                )
-                if (
-                    previous in {"en", "fr"}
-                    and previous == following
-                    and candidate["language"] != previous
-                ):
-                    reasons.append("isolated_language")
-                    neighbor_consensus[index] = previous
-            if reasons:
-                retry_reasons[index] = list(dict.fromkeys(reasons))
 
-        retry_indexes = sorted(retry_reasons)
-        retry_languages: dict[int, list[str]] = {}
-        large_items: list[dict] = []
-        for index in retry_indexes:
-            candidate = turbo_candidates[index]
-            languages = [requested_language]
-            if language == "mixed":
-                primary = (
-                    candidate["text_language"]
-                    if candidate["text_language"] in {"en", "fr"}
-                    else candidate["language"]
-                    if candidate["language"] in {"en", "fr"}
-                    else "auto"
-                )
-                languages = [primary]
-                if "isolated_language" in retry_reasons[index]:
-                    languages.append(neighbor_consensus[index])
-                elif index in neighbor_consensus and (
-                    candidate["text_anomalies"]
-                    or candidate["language"] not in {"en", "fr"}
-                ):
-                    languages = [neighbor_consensus[index]]
-            languages = list(dict.fromkeys(languages))
-            retry_languages[index] = languages
-            for retry_language in languages:
-                large_items.append(
-                    {
-                        "id": f"{windows[index]['index']}:{retry_language}",
-                        "audio_path": str(clips[index]),
-                        "language": retry_language,
-                    }
-                )
+        retry_reasons, neighbor_consensus = _escalation_reasons(turbo_candidates, language)
+        retry_languages = {
+            index: _retry_languages_for(
+                index,
+                turbo_candidates[index],
+                reasons,
+                neighbor_consensus,
+                language=language,
+                requested_language=requested_language,
+            )
+            for index, reasons in sorted(retry_reasons.items())
+        }
+        large_items = [
+            {
+                "id": f"{windows[index]['index']}:{retry_language}",
+                "audio_path": str(clips[index]),
+                "language": retry_language,
+            }
+            for index, languages in retry_languages.items()
+            for retry_language in languages
+        ]
         large_output = (
             _batch_results(worker_python, large_model, large_items, environment)
             if large_items
@@ -545,7 +734,7 @@ def transcribe_vad_cascade(
         language_counts: dict[str, int] = {}
         for index, (window, turbo) in enumerate(zip(windows, turbo_candidates)):
             large = None
-            if index in retry_indexes:
+            if index in retry_languages:
                 large_candidates: list[dict] = []
                 for retry_language in retry_languages[index]:
                     candidate = _candidate(
@@ -559,139 +748,31 @@ def transcribe_vad_cascade(
                     large_candidates.append(candidate)
                 large = max(
                     large_candidates,
-                    key=lambda candidate: (
-                        candidate["score"],
-                        -_candidate_problem_count(candidate),
-                    ),
+                    key=lambda candidate: (candidate["score"], -_candidate_problem_count(candidate)),
                 )
-            selected = turbo
-            selected_model = "turbo"
-            if large and not large["error"]:
-                if turbo["error"] or large["score"] > turbo["score"] or (
-                    large["score"] == turbo["score"]
-                    and _candidate_problem_count(large) < _candidate_problem_count(turbo)
-                ):
-                    selected = large
-                    selected_model = "large-v3"
-                    large_selected += 1
-
+            selected, selected_model = _select_candidate(turbo, large)
+            if selected_model == "large-v3":
+                large_selected += 1
             similarity = _similarity(turbo["text"], large["text"]) if large else None
             start = float(window["start"])
-            end = float(window["end"])
             selected_window_segments.append(_offset_segments(selected["segments"], start))
             quality_issues.extend(
                 _shift_issue(issue, start, int(window["index"]))
                 for issue in selected["quality_issues"]
             )
-            score = int(selected["score"])
-            tier = _tier(score)
-            detected_language = selected["language"]
-            language_counts[detected_language] = language_counts.get(detected_language, 0) + 1
-
-            if selected["error"]:
-                quality_issues.append(
-                    {
-                        "severity": "ERROR",
-                        "code": "ASR_WINDOW_FAILED",
-                        "message": f"语音窗识别失败：{selected['error']}",
-                        "start": start,
-                        "end": end,
-                        "window_key": f"vad:{window['index']}:failed",
-                    }
-                )
-            elif tier != "high":
-                quality_issues.append(
-                    {
-                        "severity": "ERROR" if tier == "low" else "WARN",
-                        "code": "ASR_LOW_CONFIDENCE" if tier == "low" else "ASR_MEDIUM_CONFIDENCE",
-                        "message": f"该语音窗转录置信度为 {score}/100（{tier}），建议人工复核。",
-                        "start": start,
-                        "end": end,
-                        "text": selected["text"],
-                        "window_key": f"vad:{window['index']}:confidence",
-                    }
-                )
-            if selected["language_conflict"]:
-                quality_issues.append(
-                    {
-                        "severity": "WARN",
-                        "code": "ASR_LANGUAGE_CONFLICT",
-                        "message": (
-                            f"Whisper 检测为 {detected_language}，但文本证据支持 "
-                            f"{selected['text_language']}，建议人工复核。"
-                        ),
-                        "start": start,
-                        "end": end,
-                        "text": selected["text"],
-                        "window_key": f"vad:{window['index']}:language-conflict",
-                    }
-                )
-            if "unspaced_text" in selected["text_anomalies"]:
-                quality_issues.append(
-                    {
-                        "severity": "WARN",
-                        "code": "ASR_UNSPACED_TEXT",
-                        "message": "检测到异常长的无空格文本，建议人工复核。",
-                        "start": start,
-                        "end": end,
-                        "text": selected["text"],
-                        "window_key": f"vad:{window['index']}:unspaced-text",
-                    }
-                )
-            if similarity is not None and similarity < 0.6:
-                quality_issues.append(
-                    {
-                        "severity": "WARN",
-                        "code": "ASR_MODEL_DISAGREEMENT",
-                        "message": f"Turbo 与 large-v3 文本差异较大（相似度 {similarity:.2f}），建议人工复核。",
-                        "start": start,
-                        "end": end,
-                        "text": selected["text"],
-                        "window_key": f"vad:{window['index']}:model-disagreement",
-                    }
-                )
-            if language == "mixed" and detected_language not in {"en", "fr"}:
-                quality_issues.append(
-                    {
-                        "severity": "WARN",
-                        "code": "ASR_UNSUPPORTED_LANGUAGE",
-                        "message": f"检测到非英语/法语语音：{detected_language}。",
-                        "start": start,
-                        "end": end,
-                        "text": selected["text"],
-                        "window_key": f"vad:{window['index']}:language",
-                    }
-                )
+            language_counts[selected["language"]] = language_counts.get(selected["language"], 0) + 1
+            quality_issues.extend(_window_issues(window, selected, similarity, language))
             confidence_windows.append(
-                {
-                    "window": int(window["index"]),
-                    "start": round(start, 3),
-                    "end": round(end, 3),
-                    "language": detected_language,
-                    "text_language": selected["text_language"],
-                    "text_language_confidence": selected["text_language_confidence"],
-                    "language_conflict": selected["language_conflict"],
-                    "text_anomalies": selected["text_anomalies"],
-                    "model": selected_model,
-                    "score": score,
-                    "tier": tier,
-                    "turbo_score": int(turbo["score"]),
-                    "large_v3_score": int(large["score"]) if large else None,
-                    "model_similarity": round(similarity, 3) if similarity is not None else None,
-                    "retry_reasons": retry_reasons.get(index, []),
-                    "retry_languages": retry_languages.get(index, []),
-                    "retry_language": (
-                        large.get("retry_language")
-                        if large and selected_model == "large-v3"
-                        else retry_languages.get(index, [None])[0]
-                        if len(retry_languages.get(index, [])) == 1
-                        else None
-                    ),
-                    "metrics": {
-                        key: round(value, 4) if isinstance(value, float) else value
-                        for key, value in selected["metrics"].items()
-                    },
-                }
+                _confidence_window(
+                    window,
+                    selected=selected,
+                    selected_model=selected_model,
+                    turbo=turbo,
+                    large=large,
+                    similarity=similarity,
+                    reasons=retry_reasons.get(index, []),
+                    languages=retry_languages.get(index, []),
+                )
             )
 
         owned_windows = _apply_ownership_boundaries(selected_window_segments, windows)
@@ -716,33 +797,19 @@ def transcribe_vad_cascade(
                 if min(float(window["end"]), segment.end)
                 > max(float(window["start"]), segment.start)
             ]
-        tiers = {"high": 0, "medium": 0, "low": 0}
-        for window in confidence_windows:
-            tiers[window["tier"]] += 1
-        summary = {
-            "total_windows": len(confidence_windows),
-            "high": tiers["high"],
-            "medium": tiers["medium"],
-            "low": tiers["low"],
-            "large_v3_escalated": len(retry_indexes),
-            "large_v3_attempts": len(large_items),
-            "large_v3_selected": large_selected,
-            "languages": language_counts,
-            "language_rechecks": sum(
-                bool({"language_conflict", "isolated_language"} & set(reasons))
-                for reasons in retry_reasons.values()
-            ),
-            "unspaced_rechecks": sum(
-                "unspaced_text" in reasons for reasons in retry_reasons.values()
-            ),
-        }
         return AdvancedAsrResult(
             segments=segments,
             quality_issues=quality_issues,
             confidence_windows=confidence_windows,
-            confidence_summary=summary,
+            confidence_summary=_cascade_summary(
+                confidence_windows,
+                retry_reasons,
+                large_attempts=len(large_items),
+                large_selected=large_selected,
+                language_counts=language_counts,
+            ),
             vad_window_count=len(windows),
-            large_v3_window_count=len(retry_indexes),
+            large_v3_window_count=len(retry_reasons),
             large_v3_selected_count=large_selected,
         )
     finally:
