@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -41,6 +42,10 @@ TRANSLATION_BATCH_ATTEMPTS = 2
 
 class TranslationError(RuntimeError):
     """Raised when a provider fails or returns invalid subtitle data."""
+
+
+class TranslationSetupError(TranslationError):
+    """The provider cannot run at all (missing CLI, not logged in): never retried."""
 
 
 @dataclass(frozen=True)
@@ -84,13 +89,13 @@ class TranslationProvider(ABC):
 def _resolve_codex_path(configured_path: str | None = None) -> str:
     candidate = configured_path or os.environ.get("SUBFLOW_CODEX") or shutil.which("codex")
     if not candidate:
-        raise TranslationError(
+        raise TranslationSetupError(
             "Codex CLI is not installed or not on PATH. Install Codex, then run "
             "`codex login` with your ChatGPT account."
         )
     path = Path(candidate).expanduser()
     if not path.is_file() or not os.access(path, os.X_OK):
-        raise TranslationError(f"Codex CLI is missing or not executable: {path}")
+        raise TranslationSetupError(f"Codex CLI is missing or not executable: {path}")
     return str(path)
 
 
@@ -291,7 +296,7 @@ class CodexCLITranslationProvider(TranslationProvider):
             status = codex_environment_status(self.codex_path)
             if not status.get("ready"):
                 details = status.get("message") or status.get("error") or ""
-                raise TranslationError(
+                raise TranslationSetupError(
                     "Codex is not logged in with ChatGPT. Run `codex login`, then retry. "
                     + str(details)
                 )
@@ -361,6 +366,36 @@ def get_translation_provider(name: str) -> TranslationProvider:
     raise TranslationError(f"Unknown translation provider: {name}")
 
 
+def _batch_fingerprint(
+    batch: Sequence[Any], *, source_language: str, model: str, provider: str
+) -> str:
+    material = json.dumps(
+        {
+            "source_language": source_language,
+            "model": model,
+            "provider": provider,
+            "segments": [[str(s.id), str(s.text)] for s in batch],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _load_checkpoint(path: Path, fingerprint: str, batch: Sequence[Any]) -> dict[str, str] | None:
+    """A previously validated batch, only if it was made from identical input."""
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(saved, dict) or saved.get("fingerprint") != fingerprint:
+        return None
+    try:
+        return parse_translation_payload({"segments": saved.get("segments")}, batch)
+    except TranslationError:
+        return None
+
+
 def _translate_in_batches(
     provider: TranslationProvider,
     segments: list[Any],
@@ -377,8 +412,26 @@ def _translate_in_batches(
     starts = list(range(0, len(segments), batch_size))
     total = len(starts)
     translations: dict[str, str] = {}
+    reused = 0
     for number, start in enumerate(starts, start=1):
         batch = segments[start : start + batch_size]
+        checkpoint = batch_dir / f"{number:03d}.checkpoint.json"
+        fingerprint = _batch_fingerprint(
+            batch, source_language=source_language, model=model, provider=provider.name
+        )
+        restored = _load_checkpoint(checkpoint, fingerprint, batch)
+        if restored is not None:
+            # Resuming a failed or interrupted run: this batch already passed
+            # validation for exactly this input, so do not pay for it twice.
+            translations.update(restored)
+            reused += 1
+            if progress:
+                progress(
+                    "translation",
+                    10 + int(80 * number / total),
+                    f"Batch {number}/{total} reused from a previous run",
+                )
+            continue
         request = TranslationRequest(
             tuple(batch),
             source_language,
@@ -401,9 +454,26 @@ def _translate_in_batches(
                 payload = provider.translate(
                     request, batch_dir / f"{number:03d}.result.json", batch_progress
                 )
-                translations.update(parse_translation_payload(payload, batch))
+                batch_translations = parse_translation_payload(payload, batch)
+                translations.update(batch_translations)
+                partial = checkpoint.with_suffix(".tmp")
+                partial.write_text(
+                    json.dumps(
+                        {
+                            "fingerprint": fingerprint,
+                            "segments": [
+                                {"id": str(s.id), "text": batch_translations[str(s.id)]} for s in batch
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                partial.replace(checkpoint)
                 last_error = None
                 break
+            except TranslationSetupError:
+                raise
             except TranslationError as error:
                 last_error = error
                 if progress and attempt < TRANSLATION_BATCH_ATTEMPTS:

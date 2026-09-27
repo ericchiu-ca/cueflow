@@ -411,6 +411,31 @@ class JobManager:
             raise RuntimeError("Could not create the translation job.")
         return snapshot
 
+    def retry_translation(self, identifier: str) -> dict:
+        """Re-run a failed translation in its project, reusing validated batches."""
+        job = self.snapshot(identifier)
+        if job is None or job.get("kind") != "translation":
+            raise ValueError("Translation job not found.")
+        if job.get("status") != "failed":
+            raise ValueError("Only a failed translation can be retried.")
+        source = Path(job["project"]) / "source.srt"
+        if not source.is_file():
+            raise ValueError("The original subtitles are no longer available; start a new translation.")
+        segments = parse_srt_text(source.read_text(encoding="utf-8"))
+        self._update(identifier, error=None, warnings=[])
+        self._submit_translation(
+            identifier,
+            segments,
+            str(job.get("source_name") or "source.srt"),
+            str(job["source_language"]),
+            str(job["model"]),
+            str(job["provider"]),
+        )
+        snapshot = self.snapshot(identifier)
+        if snapshot is None:
+            raise RuntimeError("Could not requeue the translation job.")
+        return snapshot
+
     def _submit_translation(
         self,
         identifier: str,
@@ -918,6 +943,7 @@ class CueFlowHandler(BaseHTTPRequestHandler):
         ("_post_review_audit", re.compile(r"/api/review/audit"), False),
         ("_post_transcription", re.compile(r"/api/jobs"), True),
         ("_post_translation", re.compile(r"/api/translate"), True),
+        ("_post_translation_retry", re.compile(r"/api/translate/(?P<id>[^/]+)/retry"), True),
         ("_post_ass", re.compile(r"/api/ass"), True),
         ("_post_review", re.compile(r"/api/review"), True),
         ("_post_review_save", re.compile(r"/api/review/(?P<id>[^/]+)/save"), True),
@@ -1114,6 +1140,9 @@ class CueFlowHandler(BaseHTTPRequestHandler):
             str(payload.get("provider") or "codex"),
         )
         self._send_json(result, HTTPStatus.ACCEPTED)
+
+    def _post_translation_retry(self, _query: dict, *, id: str) -> None:
+        self._send_json(self.manager.retry_translation(id), HTTPStatus.ACCEPTED)
 
     def _post_ass(self, _query: dict) -> None:
         payload = self._read_json()
