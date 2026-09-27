@@ -18,6 +18,8 @@
 
 ### Changed
 
+- 字体从 `assets/fonts/` 移到 `subflow/fonts/`，作为 package data 随包安装；`pip install --user` 等非 `sys.prefix` 安装方式不再找不到字体。License 表达式改为 `MIT AND OFL-1.1`，字体许可证与修改说明一并写入 wheel 元数据。
+- 三份 FFmpeg 查找逻辑合并为 `subflow/ffmpeg_tools.py`，探测结果按路径、修改时间和大小缓存。
 - CI matrix 增加 Python 3.12，并在仓库外用独立 venv 安装 wheel 做 smoke test，以发现打包遗漏的资源文件。
 - 将安装、模型配置、Codex 数据边界、测试命令和已知限制整理为当前公开基线的实际行为。
 - 将 `requirements.txt` 的 `yt-dlp` 下限统一为 manifest 使用的 `>=2024.1`。

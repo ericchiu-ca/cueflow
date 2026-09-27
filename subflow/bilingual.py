@@ -5,7 +5,6 @@ import json
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import unicodedata
 from collections import deque
@@ -19,17 +18,12 @@ from .ffmpeg_tools import find_ffmpeg, has_ass_filter
 from .proc import kill_tree, popen, release
 
 
-ROOT = Path(__file__).resolve().parents[1]
 SOURCE_HAN_FONT = "CueFlowHanSansSC-SemiBold.otf"
 INTER_FONT = "Inter-Medium.ttf"
 MULISH_FONT = "Mulish-SemiBold.ttf"
-REPOSITORY_FONTS_DIR = ROOT / "assets" / "fonts"
-INSTALLED_FONTS_DIR = Path(sys.prefix) / "share" / "cueflow" / "fonts"
-DEFAULT_FONTS_DIR = (
-    REPOSITORY_FONTS_DIR
-    if all((REPOSITORY_FONTS_DIR / name).is_file() for name in (SOURCE_HAN_FONT, MULISH_FONT))
-    else INSTALLED_FONTS_DIR
-)
+# Shipped as package data so every install scheme (editable, wheel, --user,
+# venv) finds them next to this module rather than under sys.prefix.
+DEFAULT_FONTS_DIR = Path(__file__).resolve().with_name("fonts")
 
 ASS_PLAY_RES_X = 1920
 ASS_PLAY_RES_Y = 1080

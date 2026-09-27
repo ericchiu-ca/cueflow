@@ -31,7 +31,7 @@ CueFlow 属于**中型单机应用**：代码位于一个 Python package 中，�
 | 媒体 | FFmpeg、FFprobe、libass、VideoToolbox | 系统外部依赖；仓库不固定版本 |
 | 测试 | `unittest` | `tests/`；没有 pytest/tox/nox 配置 |
 | CI | GitHub Actions、`macos-14` | `.github/workflows/tests.yml` |
-| 字体 | CueFlow Han Sans SC、Mulish、Inter | `assets/fonts/` 中的 OFL 文本和修改说明 |
+| 字体 | CueFlow Han Sans SC、Mulish、Inter | `subflow/fonts/` 中的 OFL 文本和修改说明（作为 package data 随包安装） |
 
 仓库没有依赖 lockfile。`requirements.txt`、`requirements-whisperx.txt` 和 `pyproject.toml` 是约束清单，不是完整环境快照。
 

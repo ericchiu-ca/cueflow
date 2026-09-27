@@ -161,10 +161,12 @@ cueflow burn input.mp4 output/bilingual.ass \
 │   ├── review.py               # 人工审校数据校验
 │   ├── bilingual.py            # ASS、预览与视频压制
 │   ├── web.py                  # 回环 HTTP 服务与任务生命周期
+│   ├── proc.py                 # 子进程生命周期（进程组、超时、退出清理）
+│   ├── ffmpeg_tools.py         # FFmpeg 查找与探测缓存
 │   ├── static/index.html       # 单页本地 UI
-│   └── schemas/                # 翻译结果 JSON Schema
+│   ├── schemas/                # 翻译结果 JSON Schema
+│   └── fonts/                  # 内置字体、许可证和修改说明（随包安装）
 ├── tests/                      # unittest 测试
-├── assets/fonts/               # 内置字体、许可证和修改说明
 ├── docs/                       # 架构、测试、发布和历史审计
 ├── pyproject.toml              # 包元数据与主要依赖声明
 ├── requirements.txt            # 兼容性安装清单
@@ -207,4 +209,4 @@ git diff --check
 
 ## 许可证
 
-仓库当前包含 [MIT License](LICENSE)。内置 CueFlow Han Sans SC、Mulish 和 Inter 字体的许可证及修改说明位于 `assets/fonts/`；发布前仍应由仓库所有者确认代码、字体二进制和所有拟发布素材的权利链。
+仓库当前包含 [MIT License](LICENSE)。内置 CueFlow Han Sans SC、Mulish 和 Inter 字体的许可证及修改说明位于 `subflow/fonts/`；发布前仍应由仓库所有者确认代码、字体二进制和所有拟发布素材的权利链。

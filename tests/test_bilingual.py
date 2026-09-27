@@ -10,6 +10,9 @@ from unittest.mock import patch
 from subflow.bilingual import (
     VIDEO_FILTER_SOURCE,
     VIDEO_FILTER_1080P,
+    DEFAULT_FONTS_DIR,
+    MULISH_FONT,
+    SOURCE_HAN_FONT,
     SubtitleBuildError,
     _VideoGeometry,
     _probe_video_info,
@@ -158,6 +161,15 @@ Public transit shaped the city.
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPackagedFonts(unittest.TestCase):
+    def test_fonts_ship_inside_the_package(self):
+        import subflow
+
+        self.assertEqual(DEFAULT_FONTS_DIR, Path(subflow.__file__).resolve().with_name("fonts"))
+        for name in (SOURCE_HAN_FONT, MULISH_FONT):
+            self.assertTrue((DEFAULT_FONTS_DIR / name).is_file(), name)
 
 
 class TestVideoProbe(unittest.TestCase):
