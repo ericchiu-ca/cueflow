@@ -425,6 +425,41 @@ class WebRobustnessTests(unittest.TestCase):
             finally:
                 manager.executor.shutdown(wait=True, cancel_futures=True)
 
+    def test_submitted_jobs_share_one_lifecycle(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            manager = make_manager(Path(temp_value) / "output")
+            try:
+                seen = {}
+
+                def good(report, project):
+                    report("working", 50, "halfway")
+                    seen["mid"] = manager.snapshot("ok")
+                    seen["project"] = project
+                    return {"message": "done", "output_path": "x"}
+
+                def bad(report, project):
+                    raise ValueError("boom")
+
+                for identifier, work in (("ok", good), ("bad", bad)):
+                    manager._create_job(identifier, "burn", Path(temp_value) / identifier)
+                    manager._submit(
+                        identifier,
+                        work,
+                        queued_message="queued",
+                        failure_message="failed hard",
+                        running={"stage": "prep", "percent": 5},
+                    )
+                manager.executor.shutdown(wait=True)
+                self.assertEqual(seen["mid"]["status"], "running")
+                self.assertEqual((seen["mid"]["stage"], seen["mid"]["percent"]), ("working", 50))
+                self.assertEqual(seen["project"], Path(temp_value) / "ok")
+                ok = manager.snapshot("ok")
+                self.assertEqual((ok["status"], ok["percent"], ok["message"], ok["output_path"]), ("complete", 100, "done", "x"))
+                bad_job = manager.snapshot("bad")
+                self.assertEqual((bad_job["status"], bad_job["message"], bad_job["error"]), ("failed", "failed hard", "boom"))
+            finally:
+                manager.executor.shutdown(wait=True, cancel_futures=True)
+
     def test_discard_project_only_removes_managed_project_directories(self):
         with tempfile.TemporaryDirectory() as temp_value:
             root = Path(temp_value) / "output"
