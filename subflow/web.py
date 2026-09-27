@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import mimetypes
+import re
 import os
 import secrets
 import shutil
@@ -244,6 +245,9 @@ class JobManager:
         with self.lock:
             if identifier in self.jobs:
                 self.jobs[identifier].update(changes)
+
+    def mark_upload_failed(self, identifier: str) -> None:
+        self._update(identifier, status="failed", stage="failed", message="Upload failed")
 
     def snapshot(self, identifier: str) -> dict | None:
         with self.lock:
@@ -868,105 +872,61 @@ class CueFlowHandler(BaseHTTPRequestHandler):
         with path.open("rb") as handle:
             shutil.copyfileobj(handle, self.wfile, length=1024 * 1024)
 
+    # Routes are (method-name, pattern). GET and POST each share one guard
+    # and error handler; POST routes flagged `writes` run inside
+    # manager.operation() so cleanup cannot delete their files mid-write.
+    GET_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = (
+        ("_get_index", re.compile(r"/")),
+        ("_get_environment", re.compile(r"/api/environment")),
+        ("_get_style_preview", re.compile(r"/api/ass-preview")),
+        ("_get_job", re.compile(r"/api/(?P<route>jobs|translate|burn)/(?P<id>[^/]+)")),
+        ("_get_ass_preview", re.compile(r"/api/ass/(?P<id>[^/]+)/preview")),
+        ("_get_review_download", re.compile(r"/api/review/(?P<id>[^/]+)/download")),
+        ("_get_ass_download", re.compile(r"/api/ass/(?P<id>[^/]+)/download")),
+        (
+            "_get_job_download",
+            re.compile(r"/api/(?P<route>jobs|translate|burn)/(?P<id>[^/]+)/download"),
+        ),
+    )
+    POST_ROUTES: tuple[tuple[str, re.Pattern[str], bool], ...] = (
+        ("_post_cleanup", re.compile(r"/api/cleanup"), False),
+        ("_post_review_audit", re.compile(r"/api/review/audit"), False),
+        ("_post_transcription", re.compile(r"/api/jobs"), True),
+        ("_post_translation", re.compile(r"/api/translate"), True),
+        ("_post_ass", re.compile(r"/api/ass"), True),
+        ("_post_review", re.compile(r"/api/review"), True),
+        ("_post_review_save", re.compile(r"/api/review/(?P<id>[^/]+)/save"), True),
+        ("_post_ass_asset", re.compile(r"/api/ass-assets"), True),
+        ("_post_burn", re.compile(r"/api/burn"), True),
+    )
+    JOB_KINDS = {"jobs": "transcription", "translate": "translation", "burn": "burn"}
+
+    @staticmethod
+    def _match(routes, path: str):
+        normalized = path.rstrip("/") or "/"
+        for route in routes:
+            match = route[1].fullmatch(normalized)
+            if match:
+                return route, match.groupdict()
+        return None, {}
+
     def do_GET(self) -> None:
+        if not request_host_is_loopback(self.headers.get("Host", "")):
+            self._error(HTTPStatus.FORBIDDEN, "CueFlow accepts loopback Host headers only.")
+            return
+        parsed = urlparse(self.path)
+        route, params = self._match(self.GET_ROUTES, parsed.path)
         try:
-            self._handle_get()
+            if route is None:
+                self._error(HTTPStatus.NOT_FOUND, "Route not found.")
+                return
+            getattr(self, route[0])(parse_qs(parsed.query), **params)
         except ConnectionError:
             return
         except ValueError as error:
             self._error(HTTPStatus.BAD_REQUEST, str(error))
         except Exception as error:
             self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Unexpected local server error: {error}")
-
-    def _handle_get(self) -> None:
-        if not request_host_is_loopback(self.headers.get("Host", "")):
-            self._error(HTTPStatus.FORBIDDEN, "CueFlow accepts loopback Host headers only.")
-            return
-        parsed = urlparse(self.path)
-        parts = [part for part in parsed.path.split("/") if part]
-        if parsed.path == "/":
-            body = STATIC_FILE.read_bytes()
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if parsed.path == "/api/environment":
-            payload = self.manager.environment()
-            payload["csrf_token"] = self.csrf_token
-            self._send_json(payload)
-            return
-        if parsed.path == "/api/ass-preview":
-            try:
-                self._send_file(
-                    self.manager.default_ass_preview(),
-                    "cueflow-ass-preview.png",
-                    attachment=False,
-                )
-            except VideoBurnError as error:
-                self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(error))
-            return
-        status_kinds = {
-            "jobs": "transcription",
-            "translate": "translation",
-            "burn": "burn",
-        }
-        if len(parts) == 3 and parts[0] == "api" and parts[1] in status_kinds:
-            expected_kind = status_kinds[parts[1]]
-            job = self.manager.snapshot(parts[2])
-            if job is None or job.get("kind") != expected_kind:
-                self._error(HTTPStatus.NOT_FOUND, "Job not found.")
-            else:
-                self._send_json(job)
-            return
-        if len(parts) == 4 and parts[:2] == ["api", "ass"] and parts[3] == "preview":
-            path = self.manager.ass_preview_path(parts[2])
-            if path is None:
-                self._error(HTTPStatus.NOT_FOUND, "ASS preview not found.")
-            else:
-                self._send_file(path, "bilingual.preview.png", attachment=False)
-            return
-        if len(parts) == 4 and parts[0] == "api" and parts[3] == "download":
-            identifier = parts[2]
-            if parts[1] == "review":
-                track = parse_qs(parsed.query).get("track", ["source"])[0]
-                if track not in {"source", "chinese"}:
-                    self._error(HTTPStatus.BAD_REQUEST, "Review track must be source or chinese.")
-                    return
-                path = self.manager.review_path(identifier, track)
-                if path is None:
-                    self._error(HTTPStatus.NOT_FOUND, "Reviewed SRT output not found.")
-                else:
-                    self._send_file(path, "reviewed.zh.srt" if track == "chinese" else "reviewed.source.srt")
-                return
-            if parts[1] == "ass":
-                path = self.manager.ass_path(identifier)
-                if path is None:
-                    self._error(HTTPStatus.NOT_FOUND, "ASS output not found.")
-                else:
-                    self._send_file(path, "bilingual.ass")
-                return
-            if parts[1] in status_kinds:
-                job = self.manager.snapshot(identifier)
-                if (
-                    not job
-                    or job.get("kind") != status_kinds[parts[1]]
-                    or job.get("status") != "complete"
-                ):
-                    self._error(HTTPStatus.NOT_FOUND, "Completed output not found.")
-                    return
-                if parts[1] == "translate" and parse_qs(parsed.query).get("format") == ["ids"]:
-                    path_key, name_key = "translation_text_path", "translation_text_name"
-                else:
-                    path_key, name_key = "output_path", "download_name"
-                if not job.get(path_key) or not job.get(name_key):
-                    self._error(HTTPStatus.NOT_FOUND, "Completed output not found.")
-                else:
-                    self._send_file(Path(job[path_key]), str(job[name_key]))
-                return
-        self._error(HTTPStatus.NOT_FOUND, "Route not found.")
 
     def do_POST(self) -> None:
         if not request_host_is_loopback(self.headers.get("Host", "")):
@@ -977,160 +937,219 @@ class CueFlowHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.FORBIDDEN, "Missing or invalid CueFlow request token.")
             return
         parsed = urlparse(self.path)
-        query = parse_qs(parsed.query)
+        route, params = self._match(self.POST_ROUTES, parsed.path)
         try:
-            if parsed.path == "/api/cleanup":
-                self._send_json(self.manager.cleanup_local_files(), HTTPStatus.OK)
+            if route is None:
+                self._error(HTTPStatus.NOT_FOUND, "Route not found.")
                 return
-            if parsed.path == "/api/review/audit":
-                # Read-only: the editor calls this after edits so the page never
-                # carries its own copy of the review rules.
-                payload = self._read_json()
-                raw_tracks = payload.get("tracks")
-                if not isinstance(raw_tracks, dict):
-                    raise ValueError("Review audit request must contain subtitle tracks.")
-                result: dict = {
-                    "tracks": {
-                        track: audit_review_track(segments, track)
-                        for track, segments in raw_tracks.items()
-                    }
-                }
-                if raw_tracks.get("source") and raw_tracks.get("chinese"):
-                    result["pairing"] = track_pairing(
-                        lenient_segments(raw_tracks["source"]),
-                        lenient_segments(raw_tracks["chinese"]),
-                    )
-                self._send_json(result)
-                return
-            # Everything but cleanup writes under output_root; register it so a
-            # concurrent cleanup refuses instead of deleting files mid-write.
-            with self.manager.operation():
-                self._handle_post(parsed, query)
+            handler = getattr(self, route[0])
+            if route[2]:
+                with self.manager.operation():
+                    handler(parse_qs(parsed.query), **params)
+            else:
+                handler(parse_qs(parsed.query), **params)
         except (ValueError, RuntimeError) as error:
             self._error(HTTPStatus.BAD_REQUEST, str(error))
         except Exception as error:
             self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Unexpected local server error: {error}")
 
-    def _handle_post(self, parsed, query: dict[str, list[str]]) -> None:
-        if parsed.path == "/api/jobs":
-            filename = query.get("filename", [""])[0]
-            language = query.get("language", ["en"])[0]
-            alignment = query.get("alignment", [self.manager.alignment_mode])[0]
-            if language not in {"en", "fr-CA", "mixed"}:
-                raise ValueError("Language must be en, fr-CA, or mixed.")
-            if alignment not in {"auto", "native", "whisperx"}:
-                raise ValueError("Alignment must be auto, native, or whisperx.")
-            job, destination = self.manager.prepare_transcription_upload(filename, language, alignment)
-            try:
-                self._receive_file(destination)
-            except Exception:
-                self.manager._update(
-                    job["id"], status="failed", stage="failed", message="Upload failed"
-                )
-                raise
-            self.manager.start_transcription(job["id"], destination, language, alignment)
-            snapshot = self.manager.snapshot(job["id"])
-            if snapshot is None:
-                raise RuntimeError("Could not create the local transcription job.")
-            self._send_json(snapshot, HTTPStatus.ACCEPTED)
+    # -- GET handlers -------------------------------------------------------
+
+    def _get_index(self, _query: dict) -> None:
+        body = STATIC_FILE.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _get_environment(self, _query: dict) -> None:
+        payload = self.manager.environment()
+        payload["csrf_token"] = self.csrf_token
+        self._send_json(payload)
+
+    def _get_style_preview(self, _query: dict) -> None:
+        try:
+            preview = self.manager.default_ass_preview()
+        except VideoBurnError as error:
+            self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(error))
             return
-        if parsed.path == "/api/translate":
-            payload = self._read_json()
-            source_filename = payload.get("source_filename")
-            source_srt = payload.get("source_srt")
-            if not isinstance(source_filename, str) or not source_filename.strip():
-                raise ValueError("A source SRT filename is required.")
-            if not isinstance(source_srt, str) or not source_srt.strip():
-                raise ValueError("A source SRT is required for translation.")
-            result = self.manager.create_translation_job(
-                source_filename,
-                source_srt,
-                str(payload.get("source_language") or "en"),
-                str(payload.get("model") or DEFAULT_CODEX_MODEL),
-                str(payload.get("provider") or "codex"),
+        self._send_file(preview, "cueflow-ass-preview.png", attachment=False)
+
+    def _get_job(self, _query: dict, *, route: str, id: str) -> None:
+        job = self.manager.snapshot(id)
+        if job is None or job.get("kind") != self.JOB_KINDS[route]:
+            self._error(HTTPStatus.NOT_FOUND, "Job not found.")
+        else:
+            self._send_json(job)
+
+    def _get_ass_preview(self, _query: dict, *, id: str) -> None:
+        path = self.manager.ass_preview_path(id)
+        if path is None:
+            self._error(HTTPStatus.NOT_FOUND, "ASS preview not found.")
+        else:
+            self._send_file(path, "bilingual.preview.png", attachment=False)
+
+    def _get_review_download(self, query: dict, *, id: str) -> None:
+        track = query.get("track", ["source"])[0]
+        if track not in {"source", "chinese"}:
+            raise ValueError("Review track must be source or chinese.")
+        path = self.manager.review_path(id, track)
+        if path is None:
+            self._error(HTTPStatus.NOT_FOUND, "Reviewed SRT output not found.")
+        else:
+            self._send_file(path, "reviewed.zh.srt" if track == "chinese" else "reviewed.source.srt")
+
+    def _get_ass_download(self, _query: dict, *, id: str) -> None:
+        path = self.manager.ass_path(id)
+        if path is None:
+            self._error(HTTPStatus.NOT_FOUND, "ASS output not found.")
+        else:
+            self._send_file(path, "bilingual.ass")
+
+    def _get_job_download(self, query: dict, *, route: str, id: str) -> None:
+        job = self.manager.snapshot(id)
+        if not job or job.get("kind") != self.JOB_KINDS[route] or job.get("status") != "complete":
+            self._error(HTTPStatus.NOT_FOUND, "Completed output not found.")
+            return
+        if route == "translate" and query.get("format") == ["ids"]:
+            path_key, name_key = "translation_text_path", "translation_text_name"
+        else:
+            path_key, name_key = "output_path", "download_name"
+        if not job.get(path_key) or not job.get(name_key):
+            self._error(HTTPStatus.NOT_FOUND, "Completed output not found.")
+        else:
+            self._send_file(Path(job[path_key]), str(job[name_key]))
+
+    # -- POST handlers ------------------------------------------------------
+
+    def _post_cleanup(self, _query: dict) -> None:
+        self._send_json(self.manager.cleanup_local_files(), HTTPStatus.OK)
+
+    def _post_review_audit(self, _query: dict) -> None:
+        # Read-only: the editor calls this after edits so the page never
+        # carries its own copy of the review rules.
+        payload = self._read_json()
+        raw_tracks = payload.get("tracks")
+        if not isinstance(raw_tracks, dict):
+            raise ValueError("Review audit request must contain subtitle tracks.")
+        result: dict = {
+            "tracks": {
+                track: audit_review_track(segments, track)
+                for track, segments in raw_tracks.items()
+            }
+        }
+        if raw_tracks.get("source") and raw_tracks.get("chinese"):
+            result["pairing"] = track_pairing(
+                lenient_segments(raw_tracks["source"]),
+                lenient_segments(raw_tracks["chinese"]),
             )
-            self._send_json(result, HTTPStatus.ACCEPTED)
-            return
-        if parsed.path == "/api/ass":
-            payload = self._read_json()
-            required = ("source_filename", "source_srt", "translation_filename", "translation_srt")
-            if any(not isinstance(payload.get(key), str) or not payload[key].strip() for key in required):
-                raise ValueError("Both source-language and Chinese SRT files are required.")
-            result = self.manager.create_ass(
-                payload["source_filename"],
-                payload["source_srt"],
-                payload["translation_filename"],
-                payload["translation_srt"],
-            )
-            self._send_json(result, HTTPStatus.CREATED)
-            return
-        if parsed.path == "/api/review":
-            payload = self._read_json()
-            source_filename = payload.get("source_filename", payload.get("filename"))
-            source_srt = payload.get("source_srt", payload.get("srt"))
-            if not isinstance(source_filename, str) or not source_filename.strip():
-                raise ValueError("A source SRT filename is required.")
-            if not isinstance(source_srt, str) or not source_srt.strip():
-                raise ValueError("A source SRT is required for review.")
-            chinese_filename = payload.get("chinese_filename")
-            chinese_srt = payload.get("chinese_srt")
-            if (chinese_filename is None) != (chinese_srt is None):
-                raise ValueError("Chinese SRT filename and content must be provided together.")
-            if chinese_srt is not None and (
-                not isinstance(chinese_filename, str)
-                or not chinese_filename.strip()
-                or not isinstance(chinese_srt, str)
-                or not chinese_srt.strip()
-            ):
-                raise ValueError("The optional Chinese SRT is invalid.")
-            self._send_json(
-                self.manager.create_review(
-                    source_filename,
-                    source_srt,
-                    chinese_filename,
-                    chinese_srt,
-                ),
-                HTTPStatus.CREATED,
-            )
-            return
-        parts = [part for part in parsed.path.split("/") if part]
-        if len(parts) == 4 and parts[:2] == ["api", "review"] and parts[3] == "save":
-            payload = self._read_json()
-            tracks = payload.get("tracks")
-            if tracks is None and "segments" in payload:
-                tracks = {"source": payload.get("segments")}
-            self._send_json(
-                self.manager.save_review(parts[2], tracks),
-                HTTPStatus.OK,
-            )
-            return
-        if parsed.path == "/api/ass-assets":
-            filename = query.get("filename", [""])[0]
-            if Path(filename).suffix.lower() != ".ass":
-                raise ValueError("Please upload an .ass subtitle file.")
-            identifier, destination = self.manager.prepare_ass_upload(filename)
+        self._send_json(result)
+
+    def _receive_job_upload(self, job: dict, destination: Path) -> None:
+        try:
             self._receive_file(destination)
-            self._send_json(self.manager.register_ass_upload(identifier, destination), HTTPStatus.CREATED)
-            return
-        if parsed.path == "/api/burn":
-            filename = query.get("filename", [""])[0]
-            ass_identifier = query.get("ass_id", [""])[0]
-            profile = query.get("profile", ["hevc-source"])[0]
-            job, destination = self.manager.prepare_burn_upload(filename, ass_identifier, profile)
-            try:
-                self._receive_file(destination)
-            except Exception:
-                self.manager._update(
-                    job["id"], status="failed", stage="failed", message="Upload failed"
-                )
-                raise
-            self.manager.start_burn(job["id"], destination, profile)
-            snapshot = self.manager.snapshot(job["id"])
-            if snapshot is None:
-                raise RuntimeError("Could not create the local video job.")
-            self._send_json(snapshot, HTTPStatus.ACCEPTED)
-            return
-        self._error(HTTPStatus.NOT_FOUND, "Route not found.")
+        except Exception:
+            self.manager.mark_upload_failed(job["id"])
+            raise
+
+    def _send_job_snapshot(self, identifier: str, missing_message: str) -> None:
+        snapshot = self.manager.snapshot(identifier)
+        if snapshot is None:
+            raise RuntimeError(missing_message)
+        self._send_json(snapshot, HTTPStatus.ACCEPTED)
+
+    def _post_transcription(self, query: dict) -> None:
+        filename = query.get("filename", [""])[0]
+        language = query.get("language", ["en"])[0]
+        alignment = query.get("alignment", [self.manager.alignment_mode])[0]
+        if language not in {"en", "fr-CA", "mixed"}:
+            raise ValueError("Language must be en, fr-CA, or mixed.")
+        if alignment not in {"auto", "native", "whisperx"}:
+            raise ValueError("Alignment must be auto, native, or whisperx.")
+        job, destination = self.manager.prepare_transcription_upload(filename, language, alignment)
+        self._receive_job_upload(job, destination)
+        self.manager.start_transcription(job["id"], destination, language, alignment)
+        self._send_job_snapshot(job["id"], "Could not create the local transcription job.")
+
+    def _post_translation(self, _query: dict) -> None:
+        payload = self._read_json()
+        source_filename = payload.get("source_filename")
+        source_srt = payload.get("source_srt")
+        if not isinstance(source_filename, str) or not source_filename.strip():
+            raise ValueError("A source SRT filename is required.")
+        if not isinstance(source_srt, str) or not source_srt.strip():
+            raise ValueError("A source SRT is required for translation.")
+        result = self.manager.create_translation_job(
+            source_filename,
+            source_srt,
+            str(payload.get("source_language") or "en"),
+            str(payload.get("model") or DEFAULT_CODEX_MODEL),
+            str(payload.get("provider") or "codex"),
+        )
+        self._send_json(result, HTTPStatus.ACCEPTED)
+
+    def _post_ass(self, _query: dict) -> None:
+        payload = self._read_json()
+        required = ("source_filename", "source_srt", "translation_filename", "translation_srt")
+        if any(not isinstance(payload.get(key), str) or not payload[key].strip() for key in required):
+            raise ValueError("Both source-language and Chinese SRT files are required.")
+        result = self.manager.create_ass(
+            payload["source_filename"],
+            payload["source_srt"],
+            payload["translation_filename"],
+            payload["translation_srt"],
+        )
+        self._send_json(result, HTTPStatus.CREATED)
+
+    def _post_review(self, _query: dict) -> None:
+        payload = self._read_json()
+        source_filename = payload.get("source_filename", payload.get("filename"))
+        source_srt = payload.get("source_srt", payload.get("srt"))
+        if not isinstance(source_filename, str) or not source_filename.strip():
+            raise ValueError("A source SRT filename is required.")
+        if not isinstance(source_srt, str) or not source_srt.strip():
+            raise ValueError("A source SRT is required for review.")
+        chinese_filename = payload.get("chinese_filename")
+        chinese_srt = payload.get("chinese_srt")
+        if (chinese_filename is None) != (chinese_srt is None):
+            raise ValueError("Chinese SRT filename and content must be provided together.")
+        if chinese_srt is not None and (
+            not isinstance(chinese_filename, str)
+            or not chinese_filename.strip()
+            or not isinstance(chinese_srt, str)
+            or not chinese_srt.strip()
+        ):
+            raise ValueError("The optional Chinese SRT is invalid.")
+        self._send_json(
+            self.manager.create_review(source_filename, source_srt, chinese_filename, chinese_srt),
+            HTTPStatus.CREATED,
+        )
+
+    def _post_review_save(self, _query: dict, *, id: str) -> None:
+        payload = self._read_json()
+        tracks = payload.get("tracks")
+        if tracks is None and "segments" in payload:
+            tracks = {"source": payload.get("segments")}
+        self._send_json(self.manager.save_review(id, tracks), HTTPStatus.OK)
+
+    def _post_ass_asset(self, query: dict) -> None:
+        filename = query.get("filename", [""])[0]
+        if Path(filename).suffix.lower() != ".ass":
+            raise ValueError("Please upload an .ass subtitle file.")
+        identifier, destination = self.manager.prepare_ass_upload(filename)
+        self._receive_file(destination)
+        self._send_json(self.manager.register_ass_upload(identifier, destination), HTTPStatus.CREATED)
+
+    def _post_burn(self, query: dict) -> None:
+        filename = query.get("filename", [""])[0]
+        ass_identifier = query.get("ass_id", [""])[0]
+        profile = query.get("profile", ["hevc-source"])[0]
+        job, destination = self.manager.prepare_burn_upload(filename, ass_identifier, profile)
+        self._receive_job_upload(job, destination)
+        self.manager.start_burn(job["id"], destination, profile)
+        self._send_job_snapshot(job["id"], "Could not create the local video job.")
 
 
 def serve(

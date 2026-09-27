@@ -261,6 +261,29 @@ class WebRobustnessTests(unittest.TestCase):
             finally:
                 fixture.close()
 
+    def test_route_tables_resolve_each_path_to_one_existing_handler(self):
+        for routes in (CueFlowHandler.GET_ROUTES, CueFlowHandler.POST_ROUTES):
+            for route in routes:
+                self.assertTrue(callable(getattr(CueFlowHandler, route[0], None)), route[0])
+        expectations = {
+            ("GET", "/"): "_get_index",
+            ("GET", "/api/jobs/abc/"): "_get_job",
+            ("GET", "/api/ass/abc/download"): "_get_ass_download",
+            ("GET", "/api/burn/abc/download"): "_get_job_download",
+            ("POST", "/api/ass"): "_post_ass",
+            ("POST", "/api/ass-assets"): "_post_ass_asset",
+            ("POST", "/api/review/audit"): "_post_review_audit",
+            ("POST", "/api/review/abc/save"): "_post_review_save",
+        }
+        for (method, path), handler in expectations.items():
+            routes = CueFlowHandler.GET_ROUTES if method == "GET" else CueFlowHandler.POST_ROUTES
+            matches = [r[0] for r in routes if r[1].fullmatch(path.rstrip("/") or "/")]
+            self.assertEqual(matches, [handler], (method, path))
+        writes = {r[0]: r[2] for r in CueFlowHandler.POST_ROUTES}
+        self.assertFalse(writes["_post_cleanup"])
+        self.assertFalse(writes["_post_review_audit"])
+        self.assertTrue(all(v for k, v in writes.items() if k not in {"_post_cleanup", "_post_review_audit"}))
+
     def test_unexpected_get_error_returns_json_500(self):
         with tempfile.TemporaryDirectory() as temp_value:
             fixture = ServerFixture(Path(temp_value) / "output")
