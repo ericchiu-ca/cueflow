@@ -2,6 +2,7 @@ import http.client
 import json
 import os
 import shutil
+import socket
 import tempfile
 import threading
 import unittest
@@ -330,6 +331,79 @@ class WebRobustnessTests(unittest.TestCase):
                 self.assertFalse(review["pairing"]["matched"])
                 self.assertEqual(review["pairing"]["drifted_ids"], ["0002", "0003"])
                 self.assertEqual(review["pairing"]["first_divergence"]["id"], "0002")
+            finally:
+                manager.executor.shutdown(wait=True, cancel_futures=True)
+
+    def test_rejected_requests_leave_no_project_directories(self):
+        source_srt = "1\n00:00:01,000 --> 00:00:02,000\nA\n\n2\n00:00:03,000 --> 00:00:04,000\nB\n"
+        drifted_srt = "1\n00:00:01,000 --> 00:00:02,000\n甲\n\n2\n00:00:09,000 --> 00:00:10,000\n乙\n"
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value) / "output"
+            manager = make_manager(root)
+            try:
+                with patch("subflow.web.render_bilingual_preview") as preview:
+                    with self.assertRaisesRegex(ValueError, "out of step"):
+                        manager.create_ass("a.srt", source_srt, "zh.srt", drifted_srt)
+                    with self.assertRaisesRegex(ValueError, "count mismatch"):
+                        manager.create_ass("a.srt", source_srt, "zh.srt", drifted_srt.split("\n\n")[0])
+                    preview.assert_not_called()
+                with self.assertRaisesRegex(ValueError, "Chinese SRT contains no usable"):
+                    manager.create_review("a.srt", source_srt, "zh.srt", "not an srt")
+                with (
+                    patch("subflow.web.render_bilingual_preview"),
+                    patch.object(Path, "write_text", side_effect=OSError("disk full")),
+                ):
+                    with self.assertRaisesRegex(OSError, "disk full"):
+                        manager.create_ass("a.srt", source_srt, "zh.srt", source_srt)
+                leftovers = [p for p in root.rglob("*")] if root.exists() else []
+                self.assertEqual([p for p in leftovers if p.is_dir() and p.parent != root], [])
+            finally:
+                manager.executor.shutdown(wait=True, cancel_futures=True)
+
+    def test_interrupted_uploads_leave_no_project_directories(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value) / "output"
+            fixture = ServerFixture(root)
+            try:
+                for path in ("/api/ass-assets?filename=a.ass", "/api/jobs?filename=talk.mp4&language=en"):
+                    with socket.create_connection(("127.0.0.1", fixture.server.server_address[1]), timeout=5) as raw:
+                        raw.sendall(
+                            (
+                                f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                                "X-CueFlow-CSRF: test-token\r\nContent-Length: 1000\r\n\r\npartial"
+                            ).encode()
+                        )
+                        raw.shutdown(socket.SHUT_WR)
+                        response = raw.recv(4096).decode(errors="replace")
+                    self.assertIn(" 400 ", response.splitlines()[0])
+                    self.assertIn("Upload ended before", response)
+                project_dirs = [p for p in root.glob("*/*") if p.is_dir()]
+                self.assertEqual(project_dirs, [])
+                failed = [job for job in fixture.manager.jobs.values() if job["status"] == "failed"]
+                self.assertEqual(len(failed), 1)  # the transcription job is still reported
+            finally:
+                fixture.close()
+
+    def test_discard_project_only_removes_managed_project_directories(self):
+        with tempfile.TemporaryDirectory() as temp_value:
+            root = Path(temp_value) / "output"
+            manager = make_manager(root)
+            try:
+                outside = Path(temp_value) / "keep"
+                outside.mkdir()
+                unmanaged = root / "mine" / "project"
+                unmanaged.mkdir(parents=True)
+                category = root / "reviews"
+                category.mkdir()
+                for candidate in (outside, unmanaged, category, root):
+                    manager.discard_project(candidate)
+                self.assertTrue(outside.is_dir())
+                self.assertTrue(unmanaged.is_dir())
+                self.assertTrue(category.is_dir())
+                managed = root / "reviews" / "20260926-a-1234"
+                managed.mkdir()
+                manager.discard_project(managed)
+                self.assertFalse(managed.exists())
             finally:
                 manager.executor.shutdown(wait=True, cancel_futures=True)
 

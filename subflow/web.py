@@ -23,9 +23,9 @@ from .bilingual import (
     MULISH_FONT,
     SOURCE_HAN_FONT,
     VideoBurnError,
+    build_bilingual_ass_text,
     burn_ass_into_video,
     find_ass_ffmpeg,
-    generate_bilingual_ass,
     render_bilingual_preview,
 )
 from . import proc
@@ -156,6 +156,27 @@ class JobManager:
         project.mkdir(parents=True, exist_ok=False)
         return project
 
+    @contextmanager
+    def _new_project(self, category: str, filename: str, identifier: str):
+        """Create a project directory that is removed again if setup fails."""
+        project = self._project_dir(category, filename, identifier)
+        try:
+            yield project
+        except BaseException:
+            self.discard_project(project)
+            raise
+
+    def discard_project(self, project: Path) -> None:
+        """Remove one CueFlow project directory, and never anything else."""
+        resolved = Path(project).absolute()
+        if (
+            resolved.parent.parent == self.output_root
+            and resolved.parent.name in MANAGED_PROJECT_CATEGORIES
+            and resolved.is_dir()
+            and not resolved.is_symlink()
+        ):
+            shutil.rmtree(resolved, ignore_errors=True)
+
     @staticmethod
     def _path_usage(path: Path) -> tuple[int, int]:
         files = 0
@@ -248,6 +269,9 @@ class JobManager:
 
     def mark_upload_failed(self, identifier: str) -> None:
         self._update(identifier, status="failed", stage="failed", message="Upload failed")
+        snapshot = self.snapshot(identifier)
+        if snapshot:
+            self.discard_project(Path(snapshot["project"]))
 
     def snapshot(self, identifier: str) -> dict | None:
         with self.lock:
@@ -422,50 +446,51 @@ class JobManager:
         return snapshot
 
     def create_ass(self, source_name: str, source_text: str, chinese_name: str, chinese_text: str) -> dict:
-        identifier = uuid.uuid4().hex
-        project = self._project_dir("bilingual", source_name, identifier)
-        source_path = project / "source.srt"
-        chinese_path = project / "zh.srt"
-        output_dir = project / "output"
-        output_dir.mkdir()
-        ass_path = output_dir / "bilingual.ass"
-        source_path.write_text(source_text, encoding="utf-8")
-        chinese_path.write_text(chinese_text, encoding="utf-8")
-        count = generate_bilingual_ass(
-            source_path,
-            chinese_path,
-            ass_path,
+        # Validate and build in memory first: a rejected pair (count mismatch,
+        # timeline drift) must not leave an empty project directory behind.
+        source_segments = parse_srt_text(source_text)
+        chinese_segments = parse_srt_text(chinese_text)
+        ass_text = build_bilingual_ass_text(
+            source_segments,
+            chinese_segments,
             title=f"{Path(source_name).stem} / {Path(chinese_name).stem}",
         )
-        preview_path = output_dir / "bilingual.preview.png"
-        preview_url = None
-        preview_error = None
-        try:
-            source_segments = parse_srt_text(source_text)
-            chinese_segments = parse_srt_text(chinese_text)
-            render_bilingual_preview(
-                preview_path,
-                source_text=source_segments[0].text,
-                chinese_text=chinese_segments[0].text,
+        count = len(source_segments)
+        identifier = uuid.uuid4().hex
+        with self._new_project("bilingual", source_name, identifier) as project:
+            output_dir = project / "output"
+            output_dir.mkdir()
+            ass_path = output_dir / "bilingual.ass"
+            (project / "source.srt").write_text(source_text, encoding="utf-8")
+            (project / "zh.srt").write_text(chinese_text, encoding="utf-8")
+            ass_path.write_text(ass_text, encoding="utf-8")
+            preview_path = output_dir / "bilingual.preview.png"
+            preview_url = None
+            preview_error = None
+            try:
+                render_bilingual_preview(
+                    preview_path,
+                    source_text=source_segments[0].text,
+                    chinese_text=chinese_segments[0].text,
+                )
+                preview_url = f"/api/ass/{identifier}/preview"
+            except VideoBurnError as error:
+                preview_error = str(_portable_metadata(str(error)))
+            manifest = {
+                "source_file": source_name,
+                "chinese_file": chinese_name,
+                "segment_count": count,
+                "timeline": "source",
+                "output": str(ass_path.relative_to(project)),
+                "preview": (
+                    str(preview_path.relative_to(project)) if preview_url else None
+                ),
+                "preview_error": preview_error,
+            }
+            (project / "manifest.json").write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+                encoding="utf-8",
             )
-            preview_url = f"/api/ass/{identifier}/preview"
-        except VideoBurnError as error:
-            preview_error = str(_portable_metadata(str(error)))
-        manifest = {
-            "source_file": source_name,
-            "chinese_file": chinese_name,
-            "segment_count": count,
-            "timeline": "source",
-            "output": str(ass_path.relative_to(project)),
-            "preview": (
-                str(preview_path.relative_to(project)) if preview_url else None
-            ),
-            "preview_error": preview_error,
-        }
-        (project / "manifest.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
         with self.lock:
             self.ass_assets[identifier] = ass_path
         return {
@@ -486,31 +511,46 @@ class JobManager:
         chinese_name: str | None = None,
         chinese_text: str | None = None,
     ) -> dict:
-        identifier = uuid.uuid4().hex
-        project = self._project_dir("reviews", source_name, identifier)
         source_segments = parse_srt_text(source_text)
         if not source_segments:
             raise ValueError("The SRT contains no usable subtitle segments.")
-        (project / "source.srt").write_text(source_text, encoding="utf-8")
         tracks: dict[str, dict] = {
             "source": {
                 "name": source_name,
                 "expected_ids": [segment.id for segment in source_segments],
-                "output_path": None,
                 "segments": review_payload(source_segments, max_source_chars=MAX_CHARS_BY_TRACK["source"]),
             }
         }
+        chinese_segments = None
         if chinese_text is not None:
             chinese_segments = parse_srt_text(chinese_text)
             if not chinese_segments:
                 raise ValueError("The Chinese SRT contains no usable subtitle segments.")
-            (project / "zh.srt").write_text(chinese_text, encoding="utf-8")
             tracks["chinese"] = {
                 "name": chinese_name or "zh.srt",
                 "expected_ids": [segment.id for segment in chinese_segments],
-                "output_path": None,
                 "segments": review_payload(chinese_segments, max_source_chars=MAX_CHARS_BY_TRACK["chinese"]),
             }
+        summaries = {key: review_summary(value["segments"]) for key, value in tracks.items()}
+        pairing = self._pairing(source_segments, chinese_segments)
+
+        identifier = uuid.uuid4().hex
+        with self._new_project("reviews", source_name, identifier) as project:
+            (project / "source.srt").write_text(source_text, encoding="utf-8")
+            if chinese_text is not None:
+                (project / "zh.srt").write_text(chinese_text, encoding="utf-8")
+            (project / "review.json").write_text(
+                json.dumps(
+                    {
+                        "tracks": {key: value["segments"] for key, value in tracks.items()},
+                        "summaries": summaries,
+                        "pairing": pairing,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
         session = {
             "project": project,
             "lock": threading.Lock(),
@@ -525,20 +565,6 @@ class JobManager:
         }
         with self.lock:
             self.review_sessions[identifier] = session
-        summaries = {key: review_summary(value["segments"]) for key, value in tracks.items()}
-        pairing = self._pairing(source_segments, chinese_segments if chinese_text is not None else None)
-        (project / "review.json").write_text(
-            json.dumps(
-                {
-                    "tracks": {key: value["segments"] for key, value in tracks.items()},
-                    "summaries": summaries,
-                    "pairing": pairing,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
         return {
             "id": identifier,
             "tracks": {
@@ -680,9 +706,9 @@ class JobManager:
             raise ValueError("Encoding profile must be hevc-source or hevc.")
         identifier = uuid.uuid4().hex
         cleaned = safe_filename(filename)
-        project = self._project_dir("renders", cleaned, identifier)
+        with self._new_project("renders", cleaned, identifier) as project:
+            shutil.copy2(ass_path, project / "bilingual.ass")
         video = project / cleaned
-        shutil.copy2(ass_path, project / "bilingual.ass")
         job = self._create_job(
             identifier,
             "burn",
@@ -1139,7 +1165,11 @@ class CueFlowHandler(BaseHTTPRequestHandler):
         if Path(filename).suffix.lower() != ".ass":
             raise ValueError("Please upload an .ass subtitle file.")
         identifier, destination = self.manager.prepare_ass_upload(filename)
-        self._receive_file(destination)
+        try:
+            self._receive_file(destination)
+        except Exception:
+            self.manager.discard_project(destination.parent)
+            raise
         self._send_json(self.manager.register_ass_upload(identifier, destination), HTTPStatus.CREATED)
 
     def _post_burn(self, query: dict) -> None:
