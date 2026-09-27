@@ -83,10 +83,10 @@ def cmd_prepare(args: argparse.Namespace) -> int:
 
     print(f"Prepared project at: {project}")
     print("Generated:")
-    print(f"- master.json")
-    print(f"- en.srt")
-    print(f"- translation_input.txt")
-    print(f"- source.m4a (only for ASR fallback)")
+    print("- master.json")
+    print("- en.srt")
+    print("- translation_input.txt")
+    print("- source.m4a (only for ASR fallback)")
     return 0
 
 
@@ -202,7 +202,7 @@ def cmd_translate_srt(args: argparse.Namespace) -> int:
         model=args.model,
         provider_name=args.provider,
         source_filename=source.name,
-        progress=lambda percent, message: print(f"[{percent:3d}%] {message}"),
+        progress=lambda _stage, percent, message: print(f"[{percent:3d}%] {message}"),
     )
     print(f"Generated Chinese SRT: {artifacts.zh_srt_path}")
     print(f"Stable-ID translation: {artifacts.translation_text_path}")

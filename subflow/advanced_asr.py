@@ -426,7 +426,7 @@ def _apply_ownership_boundaries(
 
 def _shift_issue(issue: dict, offset: float, window_index: int) -> dict:
     shifted = dict(issue)
-    for key in ("start", "end", "seek"):
+    for key in ("start", "end"):
         if isinstance(shifted.get(key), (int, float)):
             shifted[key] = round(float(shifted[key]) + offset, 3)
     shifted["window_key"] = f"vad:{window_index}:{shifted.get('window_key', 'quality')}"

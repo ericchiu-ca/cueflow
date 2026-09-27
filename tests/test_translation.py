@@ -56,7 +56,7 @@ class RecordingProvider(TranslationProvider):
     def translate(self, request, output_path, progress=None):
         self.requests.append(request)
         if progress:
-            progress(50, "working")
+            progress("translation", 50, "working")
         items = [{"id": s.id, "text": f"译{s.id}"} for s in request.segments]
         if len(self.requests) in self.broken_attempts:
             items = items[:-1]  # drop one ID, as a truncated response would
@@ -144,7 +144,7 @@ class TranslationTests(unittest.TestCase):
                 source_language="en",
                 provider_instance=provider,
                 batch_size=120,
-                progress=lambda percent, message: messages.append((percent, message)),
+                progress=lambda _stage, percent, message: messages.append((percent, message)),
             )
             result = json.loads(artifacts.result_json_path.read_text(encoding="utf-8"))
             translated = parse_srt_text(artifacts.zh_srt_path.read_text(encoding="utf-8"))

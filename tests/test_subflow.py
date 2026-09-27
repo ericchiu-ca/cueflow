@@ -126,6 +126,17 @@ class TestQCMetrics(unittest.TestCase):
         self.assertIn("LONG_CHINESE_SEGMENT", codes)
 
 
+    def test_qc_reports_every_duplicate_and_counted_length(self):
+        segments = [
+            SubtitleSegment(seg_id, index * 2.0, index * 2.0 + 1.5, "line", [])
+            for index, seg_id in enumerate(["0001", "0001", "0002", "0002", "0003"])
+        ]
+        issues = run_qc(segments, translations={"0001": "中 文 " * 20}, max_chinese_chars=10)
+        duplicate = next(issue for issue in issues if issue.code == "DUPLICATE_ID")
+        self.assertIn("(2): 0001, 0002", duplicate.message)
+        long_text = next(issue for issue in issues if issue.code == "LONG_CHINESE_SEGMENT")
+        self.assertIn("40 chars (limit 10)", long_text.message)
+
     def test_qc_accepts_ids_beyond_9999_segments(self):
         segments = [
             SubtitleSegment(f"{index:04d}", index * 2.0, index * 2.0 + 1.5, "line", [])

@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, asdict
 from datetime import timedelta
 from pathlib import Path
-from typing import Iterable, Iterator, List, Dict
+from typing import Iterable, List, Dict
 
 SRT_TIMEPOINT_RE = re.compile(r"^(\d+):(\d{2}):(\d{2})[.,](\d{3})$")
 SRT_TIME_LINE_RE = re.compile(r"^\s*(\S+)\s*-->\s*(\S+)(?:\s+.*)?$")

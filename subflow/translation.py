@@ -29,7 +29,8 @@ SOURCE_LANGUAGE_NAMES = {
     "fr-CA": "French (Canada)",
 }
 TRANSLATION_SCHEMA = Path(__file__).with_name("schemas") / "translation.schema.json"
-ProgressCallback = Callable[[int, str], None]
+# (stage, percent, message), the same shape as transcription and burning.
+ProgressCallback = Callable[[str, int, str], None]
 # One structured response covering thousands of IDs is where truncation and
 # missing IDs happen; batches keep each response small and independently
 # retryable, and neighbouring cues are sent as read-only context.
@@ -208,10 +209,6 @@ def parse_translation_payload(
     missing = [segment_id for segment_id in expected if segment_id not in translations]
     if missing:
         raise TranslationError(f"Missing translation IDs: {', '.join(missing[:8])}")
-    if len(items) != len(expected):
-        raise TranslationError(
-            f"Segment count mismatch: expected {len(expected)}, received {len(items)}."
-        )
     return translations
 
 
@@ -305,7 +302,7 @@ class CodexCLITranslationProvider(TranslationProvider):
         # 0001..N, so a stale file with the same cue count would pass validation.
         output_path.unlink(missing_ok=True)
         if progress:
-            progress(30, "Codex is translating subtitle text with structured output...")
+            progress("translation", 30, "Codex is translating subtitle text with structured output...")
         try:
             with tempfile.TemporaryDirectory(prefix="cueflow-codex-") as temp_dir:
                 result = run_captured(
@@ -329,7 +326,7 @@ class CodexCLITranslationProvider(TranslationProvider):
                 "Codex completed without writing its structured translation result."
             )
         if progress:
-            progress(82, "Validating IDs and building Chinese subtitle artifacts...")
+            progress("translation", 82, "Validating IDs and building Chinese subtitle artifacts...")
         try:
             payload = json.loads(output_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
@@ -393,10 +390,10 @@ def _translate_in_batches(
         )
         label = f"Batch {number}/{total} ({batch[0].id}-{batch[-1].id})"
 
-        def batch_progress(percent: int, message: str, *, _number: int = number) -> None:
+        def batch_progress(stage: str, percent: int, message: str, *, _number: int = number) -> None:
             if progress:
                 overall = 10 + int(80 * ((_number - 1) + min(max(percent, 0), 100) / 100) / total)
-                progress(overall, f"{label}: {message}" if total > 1 else message)
+                progress(stage, overall, f"{label}: {message}" if total > 1 else message)
 
         last_error: TranslationError | None = None
         for attempt in range(1, TRANSLATION_BATCH_ATTEMPTS + 1):
@@ -411,6 +408,7 @@ def _translate_in_batches(
                 last_error = error
                 if progress and attempt < TRANSLATION_BATCH_ATTEMPTS:
                     progress(
+                        "translation",
                         10 + int(80 * (number - 1) / total),
                         f"{label} failed ({error}); retrying once...",
                     )
@@ -436,7 +434,9 @@ def run_translation_project(
         raise TranslationError(f"Unsupported source language: {source_language}")
     if not segments:
         raise TranslationError("The source SRT contains no subtitle segments.")
-    if model not in CODEX_MODEL_CHOICES:
+    provider = provider_instance or get_translation_provider(provider_name)
+    # Model names are provider-specific; only Codex has a fixed list today.
+    if isinstance(provider, CodexCLITranslationProvider) and model not in CODEX_MODEL_CHOICES:
         raise TranslationError(f"Unsupported Codex model: {model}")
 
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -477,7 +477,6 @@ def run_translation_project(
         encoding="utf-8",
     )
 
-    provider = provider_instance or get_translation_provider(provider_name)
     translations = _translate_in_batches(
         provider,
         list(segments),
@@ -505,7 +504,7 @@ def run_translation_project(
     zh_srt_path.write_text(build_srt_text(translated_segments), encoding="utf-8")
     warnings = translation_warnings(segments, translations)
     if progress:
-        progress(96, "Chinese SRT and stable-ID translation files are ready.")
+        progress("writing", 96, "Chinese SRT and stable-ID translation files are ready.")
     return TranslationArtifacts(
         master_path=master_path,
         source_srt_path=source_srt_path,

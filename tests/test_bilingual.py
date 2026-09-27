@@ -109,6 +109,25 @@ Public transit shaped the city.
             with self.assertRaisesRegex(VideoBurnError, "could not render the ASS preview"):
                 render_bilingual_preview(Path(temp_value) / "p.png", fonts_dir=fonts)
 
+    def test_render_layout_honours_edited_styles(self):
+        editable = build_bilingual_ass_text(self.source, self.chinese)
+        edited = editable.replace(
+            "Style: Source,Mulish SemiBold,64,&H00F0F0F0",
+            "Style: Source,Inter Medium,58,&H0000FFFF",
+        ).replace("Style: Chinese,CueFlow Han Sans SC,94,", "Style: Chinese,CueFlow Han Sans SC,88,")
+        output = adapt_bilingual_ass_for_render(edited, frame_width=1920, frame_height=1080)
+        self.assertIn(r"\fnInter Medium\fs58\1c&H00FFFF&", output)
+        self.assertIn("Style: Bilingual,CueFlow Han Sans SC,88,", output)
+
+    def test_render_layout_fallback_is_reported(self):
+        editable = build_bilingual_ass_text(self.source, self.chinese)
+        retimed = editable.replace("Dialogue: 1,0:00:01.00,0:00:03.50,Chinese", "Dialogue: 1,0:00:01.10,0:00:03.50,Chinese")
+        warnings = []
+        output = adapt_bilingual_ass_for_render(retimed, frame_width=1920, frame_height=1080, warnings=warnings)
+        self.assertEqual(output, retimed)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("0:00:01.00-0:00:03.50", warnings[0])
+
     def test_ass_escapes_override_characters_and_line_breaks(self):
         self.assertEqual(
             ass_escape_text("Use {x}\\path\nnext"),

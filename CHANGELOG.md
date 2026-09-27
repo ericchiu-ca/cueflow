@@ -18,6 +18,7 @@
 
 ### Changed
 
+- 翻译进度回调统一为 `(stage, percent, message)`，与转录、压制一致；Codex 模型白名单只对 Codex provider 生效。移除不可达的检查与未使用代码。
 - Web 处理器改为路由表（每个接口一个方法，统一 Host/CSRF 校验与错误处理，POST 路由声明是否写文件）；`transcribe_vad_cascade` 拆分为升级原因、重试语言、候选选择、问题生成和汇总等小函数，行为不变。
 - Codex 翻译按每批 120 条分批进行，附带前后各 3 条只读上下文；每批单独校验、失败重试一次，进度按批次显示。长视频不再依赖单次输出覆盖全部 ID。Codex 登录状态每个任务只检查一次。
 - 审校规则只在后端实现：审校台通过新的只读接口 `POST /api/review/audit` 获取问题和双轨配对状态，不再在页面里复制一份规则。此前两份实现已出现差异（重复文本是否忽略空白、非有限时间是否报错、提示文案）。
@@ -49,6 +50,9 @@
 - YouTube 字幕检测改用 yt-dlp 的结构化 JSON；原先按 `--list-subs` 文本匹配 "automatic subtitles"，而 yt-dlp 实际输出 "automatic captions"，导致自动字幕被当成人工字幕。自动字幕只接受原始语音轨（`en-orig`），不再把非英语视频的机器翻译当作英文原文。
 - Web 响应增加 `X-Frame-Options: DENY`、`frame-ancestors 'none'`、`nosniff` 和 `no-referrer`，防止页面被第三方网站嵌入做点击劫持。
 - QC 与审校共用稳定 ID 规则（4 位以上数字）；超过 9999 条字幕时 QC 不再误报 `INVALID_ID`。
+- 烧录时若中英事件无法一一配对，仍按原 ASS 渲染，但会在进度与结果中给出警告，不再静默回退；渲染布局读取 ASS 中 `Chinese` / `Source` 样式的字体、字号、颜色和描边，用户在 Aegisub 等工具中的样式修改会生效。
+- QC 一次列出全部重复 ID；中文过长提示显示实际计数（不含空白）和上限。
+- 审校台有未保存修改时，清理确认和关闭页面会提示；任务轮询遇到网络中断会自动重试。
 - WhisperX 对齐后只在文本确实对应时才恢复原字幕文本；条数相同但中间错位时不再把文本贴到错误的时间上。
 - `align-project` 新增 `--source`，可对 `transcribe-file` 生成、媒体不在项目目录中的项目重新对齐（文件名须与 `master.json` 记录一致）；语言选项增加 `mixed`。
 - ASR worker 失败时报告其结构化错误并截断，不再把整段库日志塞进任务消息；worker 响应校验类型和协议版本。

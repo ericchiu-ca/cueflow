@@ -406,8 +406,8 @@ class JobManager:
                 message="Preparing stable subtitle IDs",
             )
 
-            def report(percent: int, message: str) -> None:
-                self._update(identifier, percent=percent, message=message)
+            def report(stage: str, percent: int, message: str) -> None:
+                self._update(identifier, stage=stage, percent=percent, message=message)
 
             try:
                 artifacts = run_translation_project(
@@ -750,12 +750,14 @@ class JobManager:
                 output_dir = project / "output"
                 output_dir.mkdir(exist_ok=True)
                 output = output_dir / f"{video.stem}.bilingual.mp4"
+                warnings: list[str] = []
                 burn_ass_into_video(
                     video,
                     project / "bilingual.ass",
                     output,
                     profile=profile,
                     progress=report,
+                    warnings=warnings,
                 )
                 self._update(
                     identifier,
@@ -763,6 +765,7 @@ class JobManager:
                     stage="complete",
                     percent=100,
                     message="Bilingual MP4 generated locally",
+                    warnings=warnings,
                     download_url=f"/api/burn/{identifier}/download",
                     download_name=output.name,
                     output_path=str(output),
