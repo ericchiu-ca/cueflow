@@ -9,6 +9,8 @@ from typing import Iterable, Iterator, List, Dict
 
 SRT_TIMEPOINT_RE = re.compile(r"^(\d+):(\d{2}):(\d{2})[.,](\d{3})$")
 ID_TAG_RE = re.compile(r"^\[(\d+)\]\s*$")
+# stable_id() zero-pads to 4 digits and grows past 9999 cues.
+STABLE_ID_RE = re.compile(r"\d{4,}")
 
 
 @dataclass

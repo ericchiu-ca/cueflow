@@ -5,7 +5,7 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Iterable, Mapping
 
-from .core import SubtitleSegment
+from .core import STABLE_ID_RE, SubtitleSegment
 
 
 @dataclass(frozen=True)
@@ -138,7 +138,7 @@ def segments_from_review_payload(
             raise ValueError(
                 f"Review segment ID/order changed at position {index}: expected {expected_id}, received {segment_id}."
             )
-        if not re.fullmatch(r"\d{4,}", segment_id):
+        if not STABLE_ID_RE.fullmatch(segment_id):
             raise ValueError(f"Review segment {index} has an invalid stable ID: {segment_id}.")
         if segment_id in seen_ids:
             raise ValueError(f"Review segment ID is duplicated: {segment_id}.")

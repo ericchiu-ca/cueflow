@@ -115,6 +115,15 @@ class TestQCMetrics(unittest.TestCase):
         self.assertIn("LONG_CHINESE_SEGMENT", codes)
 
 
+    def test_qc_accepts_ids_beyond_9999_segments(self):
+        segments = [
+            SubtitleSegment(f"{index:04d}", index * 2.0, index * 2.0 + 1.5, "line", [])
+            for index in range(1, 10002)
+        ]
+        codes = {issue.code for issue in run_qc(segments)}
+        self.assertNotIn("INVALID_ID", codes)
+
+
 class TestTranslationParser(unittest.TestCase):
     def test_parse_translation_file(self):
         content = """
