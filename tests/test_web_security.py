@@ -391,7 +391,10 @@ class WebRobustnessTests(unittest.TestCase):
                             ).encode()
                         )
                         raw.shutdown(socket.SHUT_WR)
-                        response = raw.recv(4096).decode(errors="replace")
+                        chunks = []
+                        while chunk := raw.recv(4096):
+                            chunks.append(chunk)
+                        response = b"".join(chunks).decode(errors="replace")
                     self.assertIn(" 400 ", response.splitlines()[0])
                     self.assertIn("Upload ended before", response)
                 project_dirs = [p for p in root.glob("*/*") if p.is_dir()]
