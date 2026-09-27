@@ -1,38 +1,21 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 from pathlib import Path
 
 from .core import SubtitleSegment
+from .ffmpeg_tools import find_ffmpeg, is_runnable
 from .proc import run_captured
 
 YT_DLP = "yt-dlp"
-FFMPEG_FULL_PATH = Path("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg")
 DEFAULT_COMMAND_TIMEOUT = 14400
-
-
-def _is_runnable(candidate: Path) -> bool:
-    if not candidate.is_file() or not os.access(candidate, os.X_OK):
-        return False
-    try:
-        result = subprocess.run(
-            [str(candidate), "-version" if "ffmpeg" in candidate.name else "--version"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=15,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0
 
 
 def ensure_command(command: str) -> str:
     resolved = shutil.which(command)
-    if resolved is None or not _is_runnable(Path(resolved)):
+    if resolved is None or not is_runnable(Path(resolved), "--version"):
         raise RuntimeError(
             f"`{command}` is required but missing or not runnable.\n"
             f"Install or repair it first. Example: `brew install {command}`."
@@ -41,28 +24,14 @@ def ensure_command(command: str) -> str:
 
 
 def find_working_ffmpeg() -> str:
-    candidates: list[Path] = []
-    configured = os.environ.get("SUBFLOW_FFMPEG")
-    if configured:
-        candidates.append(Path(configured).expanduser())
-    candidates.append(FFMPEG_FULL_PATH)
-    for command in ("ffmpeg-full", "ffmpeg"):
-        resolved = shutil.which(command)
-        if resolved:
-            candidates.append(Path(resolved))
-    seen: set[str] = set()
-    for candidate in candidates:
-        key = str(candidate.absolute())
-        if key in seen:
-            continue
-        seen.add(key)
-        if _is_runnable(candidate):
-            return key
-    raise RuntimeError(
-        "A runnable FFmpeg is required for YouTube audio extraction. "
-        "Install `ffmpeg-full` with `brew install ffmpeg-full`, or set "
-        "SUBFLOW_FFMPEG to a working executable."
-    )
+    ffmpeg, _tried = find_ffmpeg()
+    if ffmpeg is None:
+        raise RuntimeError(
+            "A runnable FFmpeg is required for YouTube audio extraction. "
+            "Install `ffmpeg-full` with `brew install ffmpeg-full`, or set "
+            "SUBFLOW_FFMPEG to a working executable."
+        )
+    return str(ffmpeg)
 
 
 def run_command(

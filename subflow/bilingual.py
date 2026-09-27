@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import html
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -16,6 +15,7 @@ from statistics import median
 from typing import Callable, Iterable
 
 from .core import SubtitleSegment, parse_srt_file
+from .ffmpeg_tools import find_ffmpeg, has_ass_filter
 from .proc import kill_tree, popen, release
 
 
@@ -442,45 +442,15 @@ def generate_bilingual_ass(
     return len(source)
 
 
-def _has_ass_filter(candidate: Path) -> bool:
-    try:
-        completed = subprocess.run(
-            [str(candidate), "-hide_banner", "-filters"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    filters = f"{completed.stdout}\n{completed.stderr}"
-    return completed.returncode == 0 and bool(re.search(r"\bass\s+V->V\b", filters))
-
-
 def find_ass_ffmpeg(configured: str | Path | None = None) -> Path:
-    candidates: list[Path] = []
-    configured_value = configured or os.environ.get("SUBFLOW_FFMPEG")
-    if configured_value:
-        candidates.append(Path(configured_value).expanduser())
-    candidates.append(Path("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"))
-    for command in ("ffmpeg-full", "ffmpeg"):
-        found = shutil.which(command)
-        if found:
-            candidates.append(Path(found))
-
-    seen: set[str] = set()
-    for candidate in candidates:
-        key = str(candidate.absolute())
-        if key in seen:
-            continue
-        seen.add(key)
-        if candidate.is_file() and os.access(candidate, os.X_OK) and _has_ass_filter(candidate):
-            return candidate.absolute()
-    raise VideoBurnError(
-        "An FFmpeg build with the libass `ass` filter is required. "
-        "On Apple Silicon macOS install it with `brew install ffmpeg-full`. "
-        "CueFlow uses /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg without changing your PATH."
-    )
+    ffmpeg, _tried = find_ffmpeg(configured, accept=has_ass_filter)
+    if ffmpeg is None:
+        raise VideoBurnError(
+            "An FFmpeg build with the libass `ass` filter is required. "
+            "On Apple Silicon macOS install it with `brew install ffmpeg-full`. "
+            "CueFlow uses /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg without changing your PATH."
+        )
+    return ffmpeg
 
 
 def _ffprobe_path(ffmpeg: Path) -> Path:

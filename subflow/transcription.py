@@ -4,7 +4,6 @@ import importlib.util
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -18,6 +17,7 @@ from .core import (
     normalize_segments,
     save_master_json,
 )
+from .ffmpeg_tools import find_ffmpeg
 from .proc import run_captured
 
 
@@ -174,51 +174,15 @@ def safe_filename(value: str) -> str:
     return cleaned[:180]
 
 
-FFMPEG_FULL_PATH = Path("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg")
-
-
-def _is_runnable_ffmpeg(candidate: Path) -> bool:
-    if not candidate.is_file() or not os.access(candidate, os.X_OK):
-        return False
-    try:
-        completed = subprocess.run(
-            [str(candidate), "-version"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return completed.returncode == 0
-
-
 def _ensure_ffmpeg() -> str:
-    candidates: list[Path] = []
-    configured = os.environ.get("SUBFLOW_FFMPEG")
-    if configured:
-        candidates.append(Path(configured).expanduser())
-    candidates.append(FFMPEG_FULL_PATH)
-    for command in ("ffmpeg-full", "ffmpeg"):
-        found = shutil.which(command)
-        if found:
-            candidates.append(Path(found))
-
-    seen: set[str] = set()
-    for candidate in candidates:
-        key = str(candidate.absolute())
-        if key in seen:
-            continue
-        seen.add(key)
-        if _is_runnable_ffmpeg(candidate):
-            return key
-
-    tried = ", ".join(seen) or "no candidates found"
+    ffmpeg, tried = find_ffmpeg()
+    if ffmpeg is not None:
+        return str(ffmpeg)
     raise TranscriptionError(
         "A runnable FFmpeg is required for audio extraction. "
-        f"CueFlow tried: {tried}. Install `ffmpeg-full` with "
-        "`brew install ffmpeg-full`, or repair a broken Homebrew FFmpeg with "
-        "`brew reinstall ffmpeg`."
+        f"CueFlow tried: {', '.join(map(str, tried)) or 'no candidates found'}. "
+        "Install `ffmpeg-full` with `brew install ffmpeg-full`, or repair a broken "
+        "Homebrew FFmpeg with `brew reinstall ffmpeg`."
     )
 
 

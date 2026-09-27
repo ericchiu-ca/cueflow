@@ -1,10 +1,12 @@
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import subflow.ffmpeg_tools as ffmpeg_tools
 import subflow.yt_workflow as workflow
 
 
@@ -28,9 +30,9 @@ class ExternalCommandTests(unittest.TestCase):
             broken.chmod(0o755)
             working.chmod(0o755)
             with (
-                patch.dict(workflow.os.environ, {"SUBFLOW_FFMPEG": str(broken)}),
-                patch.object(workflow, "FFMPEG_FULL_PATH", working),
-                patch.object(workflow.shutil, "which", return_value=str(broken)),
+                patch.dict(os.environ, {"SUBFLOW_FFMPEG": str(broken)}),
+                patch.object(ffmpeg_tools, "FFMPEG_FULL_PATH", working),
+                patch.object(ffmpeg_tools.shutil, "which", return_value=str(broken)),
             ):
                 self.assertEqual(workflow.find_working_ffmpeg(), str(working.absolute()))
 
