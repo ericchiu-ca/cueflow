@@ -261,6 +261,19 @@ class WebRobustnessTests(unittest.TestCase):
             finally:
                 manager.executor.shutdown(wait=True, cancel_futures=True)
 
+    def test_review_pairing_reports_time_drift_with_equal_counts(self):
+        source_srt = "1\n00:00:01,000 --> 00:00:02,000\nA\n\n2\n00:00:03,000 --> 00:00:04,000\nB\n\n3\n00:00:05,000 --> 00:00:06,000\nC\n"
+        chinese_srt = "1\n00:00:01,000 --> 00:00:02,000\n甲\n\n2\n00:00:05,000 --> 00:00:06,000\n丙\n\n3\n00:00:07,000 --> 00:00:08,000\n丁\n"
+        with tempfile.TemporaryDirectory() as temp_value:
+            manager = make_manager(Path(temp_value) / "output")
+            try:
+                review = manager.create_review("a.srt", source_srt, "zh.srt", chinese_srt)
+                self.assertFalse(review["pairing"]["matched"])
+                self.assertEqual(review["pairing"]["drifted_ids"], ["0002", "0003"])
+                self.assertEqual(review["pairing"]["first_divergence"]["id"], "0002")
+            finally:
+                manager.executor.shutdown(wait=True, cancel_futures=True)
+
     def test_cleanup_and_in_flight_writes_exclude_each_other(self):
         with tempfile.TemporaryDirectory() as temp_value:
             root = Path(temp_value) / "output"

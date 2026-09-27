@@ -13,7 +13,7 @@ from pathlib import Path
 from statistics import median
 from typing import Callable, Iterable
 
-from .core import SubtitleSegment, parse_srt_file
+from .core import SubtitleSegment, parse_srt_file, track_pairing
 from .ffmpeg_tools import find_ffmpeg, has_ass_filter
 from .proc import kill_tree, popen, release
 
@@ -103,6 +103,11 @@ def _plain_subtitle_text(value: str) -> str:
 ASS_LITERAL_BACKSLASH = "\\\u2060"
 
 
+def _srt_clock(seconds: float) -> str:
+    whole = int(seconds)
+    return f"{whole // 3600:02d}:{whole % 3600 // 60:02d}:{whole % 60:02d}"
+
+
 def ass_escape_text(value: str) -> str:
     escaped_lines: list[str] = []
     normalized = _plain_subtitle_text(value).replace("\r\n", "\n").replace("\r", "\n")
@@ -126,11 +131,26 @@ def _validate_tracks(
         raise SubtitleBuildError("The source-language SRT contains no usable subtitle segments.")
     if not chinese:
         raise SubtitleBuildError("The Chinese SRT contains no usable subtitle segments.")
+    pairing = track_pairing(source, chinese)
+    divergence = pairing["first_divergence"]
+    where = (
+        f" The tracks first diverge at source cue {divergence['id']} ({_srt_clock(divergence['start'])})."
+        if divergence
+        else ""
+    )
     if len(source) != len(chinese):
         raise SubtitleBuildError(
             "Subtitle count mismatch: "
-            f"source has {len(source)} segments, Chinese has {len(chinese)}. "
-            "This MVP pairs subtitles by order and requires equal counts."
+            f"source has {len(source)} segments, Chinese has {len(chinese)}."
+            + where
+        )
+    if pairing["drifted_ids"]:
+        drifted = pairing["drifted_ids"]
+        raise SubtitleBuildError(
+            "Chinese subtitles are out of step with the source timeline at "
+            f"{len(drifted)} cue(s): {', '.join(drifted[:8])}."
+            + where
+            + " A cue was probably removed in one place and added in another."
         )
     empty = [str(index) for index, segment in enumerate(chinese, start=1) if not segment.text.strip()]
     if empty:

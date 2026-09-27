@@ -64,6 +64,27 @@ Public transit shaped the city.
         with self.assertRaisesRegex(SubtitleBuildError, "count mismatch"):
             build_bilingual_ass_text(self.source, self.chinese[:1])
 
+    def test_ass_rejects_tracks_that_drift_on_a_shared_timeline(self):
+        def track(*cues):
+            return parse_srt_text(
+                "".join(
+                    f"{index}\n00:00:{start:02d},000 --> 00:00:{end:02d},000\n{text}\n\n"
+                    for index, (start, end, text) in enumerate(cues, start=1)
+                )
+            )
+
+        source = track((1, 2, "one"), (3, 4, "two"), (5, 6, "three"), (7, 8, "four"))
+        # Same count, but cue two was deleted and a new cue added after four.
+        chinese = track((1, 2, "一"), (5, 6, "三"), (7, 8, "四"), (9, 10, "五"))
+        with self.assertRaisesRegex(SubtitleBuildError, "out of step.*0002, 0003, 0004.*diverge at source cue 0002"):
+            build_bilingual_ass_text(source, chinese)
+
+        with self.assertRaisesRegex(SubtitleBuildError, "count mismatch.*diverge at source cue 0002"):
+            build_bilingual_ass_text(source, chinese[:3])
+
+        shifted = track((1, 2, "一"), (3, 4, "二"), (5, 6, "三"), (7, 8, "四"))
+        self.assertIn("二", build_bilingual_ass_text(source, shifted))
+
     def test_ass_escapes_override_characters_and_line_breaks(self):
         self.assertEqual(
             ass_escape_text("Use {x}\\path\nnext"),

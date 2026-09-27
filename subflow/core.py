@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from bisect import bisect_left
 import re
 from dataclasses import dataclass, asdict
 from datetime import timedelta
@@ -55,6 +56,61 @@ def normalize_segments(segments: Iterable[SubtitleSegment]) -> List[SubtitleSegm
         )
         for i, seg in enumerate(segments, start=1)
     ]
+
+
+PAIRING_TIME_TOLERANCE = 0.25
+
+
+def _cues_overlap(first: SubtitleSegment, second: SubtitleSegment, tolerance: float) -> bool:
+    return first.start < second.end + tolerance and second.start < first.end + tolerance
+
+
+def track_pairing(
+    source: List[SubtitleSegment],
+    chinese: List[SubtitleSegment],
+    *,
+    tolerance: float = PAIRING_TIME_TOLERANCE,
+) -> Dict[str, object]:
+    """Check that the Nth Chinese cue belongs to the Nth source cue.
+
+    Counts alone cannot catch a cue deleted in one place and added in
+    another. When most pairs overlap in time the tracks share a timeline and
+    every pair must overlap; tracks on unrelated timelines are paired by order
+    with the source timing authoritative.
+    """
+    overlaps = [_cues_overlap(s, z, tolerance) for s, z in zip(source, chinese)]
+    # Decide "same timeline" independently of order, otherwise an early
+    # deletion makes every later pair miss and looks like unrelated timing.
+    ordered = sorted(source, key=lambda cue: cue.start)
+    starts = [cue.start for cue in ordered]
+    on_source_timeline = 0
+    for cue in chinese:
+        index = bisect_left(starts, cue.end + tolerance)
+        if any(_cues_overlap(candidate, cue, tolerance) for candidate in ordered[max(0, index - 3) : index]):
+            on_source_timeline += 1
+    shared = bool(chinese) and on_source_timeline * 2 >= len(chinese)
+    first_divergence = next(
+        (source[index] for index, ok in enumerate(overlaps) if not ok), None
+    ) if shared else None
+    if shared and len(source) != len(chinese) and first_divergence is None:
+        first_divergence = source[len(overlaps)] if len(source) > len(overlaps) else None
+    drifted_ids = (
+        [source[index].id for index, ok in enumerate(overlaps) if not ok]
+        if shared and len(source) == len(chinese)
+        else []
+    )
+    return {
+        "source_count": len(source),
+        "chinese_count": len(chinese),
+        "timeline": "shared" if shared else "independent",
+        "drifted_ids": drifted_ids,
+        "first_divergence": (
+            {"id": first_divergence.id, "start": first_divergence.start}
+            if first_divergence is not None
+            else None
+        ),
+        "matched": len(source) == len(chinese) and not drifted_ids,
+    }
 
 
 def parse_srt_text(raw: str) -> List[SubtitleSegment]:

@@ -28,7 +28,7 @@ from .bilingual import (
     render_bilingual_preview,
 )
 from . import proc
-from .core import build_srt_text, parse_srt_text, save_master_json
+from .core import build_srt_text, parse_srt_text, save_master_json, track_pairing
 from .review import review_payload, review_summary, segments_from_review_payload
 from .transcription import (
     _portable_metadata,
@@ -515,12 +515,7 @@ class JobManager:
         with self.lock:
             self.review_sessions[identifier] = session
         summaries = {key: review_summary(value["segments"]) for key, value in tracks.items()}
-        pairing = {
-            "source_count": len(tracks["source"]["segments"]),
-            "chinese_count": len(tracks.get("chinese", {}).get("segments", [])),
-            "matched": "chinese" not in tracks
-            or len(tracks["source"]["segments"]) == len(tracks["chinese"]["segments"]),
-        }
+        pairing = self._pairing(source_segments, chinese_segments if chinese_text is not None else None)
         (project / "review.json").write_text(
             json.dumps(
                 {
@@ -542,6 +537,12 @@ class JobManager:
             "pairing": pairing,
             "project": str(project),
         }
+
+    @staticmethod
+    def _pairing(source: list, chinese: list | None) -> dict:
+        if chinese is None:
+            return {"source_count": len(source), "chinese_count": 0, "matched": True}
+        return track_pairing(source, chinese)
 
     def save_review(self, identifier: str, raw_tracks: object) -> dict:
         with self.lock:
@@ -598,13 +599,8 @@ class JobManager:
                 persisted_tracks[track] = payload
                 with self.lock:
                     track_session["output_path"] = output_path
-            source_count = len(results["source"]["segments"])
-            chinese_count = len(results.get("chinese", {}).get("segments", []))
-            pairing = {
-                "source_count": source_count,
-                "chinese_count": chinese_count,
-                "matched": "chinese" not in results or source_count == chinese_count,
-            }
+            segments_by_track = {track: segments for track, _session, segments, _payload in prepared}
+            pairing = self._pairing(segments_by_track["source"], segments_by_track.get("chinese"))
             _write_text_atomic(
                 project / "review.json",
                 json.dumps(

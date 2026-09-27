@@ -46,6 +46,7 @@
 - YouTube 字幕检测改用 yt-dlp 的结构化 JSON；原先按 `--list-subs` 文本匹配 "automatic subtitles"，而 yt-dlp 实际输出 "automatic captions"，导致自动字幕被当成人工字幕。自动字幕只接受原始语音轨（`en-orig`），不再把非英语视频的机器翻译当作英文原文。
 - Web 响应增加 `X-Frame-Options: DENY`、`frame-ancestors 'none'`、`nosniff` 和 `no-referrer`，防止页面被第三方网站嵌入做点击劫持。
 - QC 与审校共用稳定 ID 规则（4 位以上数字）；超过 9999 条字幕时 QC 不再误报 `INVALID_ID`。
+- 中英轨在同一时间轴上时按时间校验配对：条数相同但中间删一条、别处补一条的情况会被拒绝，并指出从哪一条开始错开；时间轴无关的两轨仍按顺序配对。审校台同步显示错位位置。
 - 合并并持续读取 FFmpeg 输出，避免管道阻塞；为 YouTube 外部命令增加可运行性检查与超时。
 - 上传先写入临时文件再原子重命名，失败任务会进入失败状态。
 - wheel 包含 Web 静态文件、JSON Schema 和字体资源。
