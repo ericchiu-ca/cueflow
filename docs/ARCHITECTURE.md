@@ -88,7 +88,7 @@ flowchart TD
 
 ### 翻译边界
 
-`translation.py` 把每段的 `id`、`start`、`end`、`text`，连同源语言和所选模型交给 Codex。Codex 在空临时目录中以 `--ephemeral --ignore-user-config --ignore-rules --sandbox read-only --skip-git-repo-check` 运行，并用仓库内 JSON Schema 限制输出。
+`translation.py` 把每段的 `id`、`start`、`end`、`text`，连同源语言和所选模型交给 Codex。Codex 在空临时目录中以 `--ephemeral --ignore-user-config --ignore-rules --sandbox read-only --skip-git-repo-check` 运行，并用仓库内 JSON Schema 限制输出。长字幕按每批 120 条分多次请求，每批附带前后各 3 条原文作为只读上下文（同样是字幕段数据，不要求翻译或返回）；每批单独校验 ID，失败重试一次，最终合并写入 `translation.result.json`，各批原始结果保存在 `translation.batches/`。
 
 项目保留 `source.srt`、`master.json`、`translation_input.txt`、`translation.result.json`、`translation_zh.txt` 与 `output/zh.srt`。`openai-api` provider 当前明确报错，不读取 API key 或发起 API 请求。
 

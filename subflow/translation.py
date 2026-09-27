@@ -30,6 +30,12 @@ SOURCE_LANGUAGE_NAMES = {
 }
 TRANSLATION_SCHEMA = Path(__file__).with_name("schemas") / "translation.schema.json"
 ProgressCallback = Callable[[int, str], None]
+# One structured response covering thousands of IDs is where truncation and
+# missing IDs happen; batches keep each response small and independently
+# retryable, and neighbouring cues are sent as read-only context.
+TRANSLATION_BATCH_SIZE = 120
+TRANSLATION_CONTEXT_CUES = 3
+TRANSLATION_BATCH_ATTEMPTS = 2
 
 
 class TranslationError(RuntimeError):
@@ -41,6 +47,8 @@ class TranslationRequest:
     segments: tuple[Any, ...]
     source_language: str
     model: str = DEFAULT_CODEX_MODEL
+    context_before: tuple[Any, ...] = ()
+    context_after: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -128,15 +136,28 @@ def build_translation_prompt(request: TranslationRequest) -> str:
     source_name = SOURCE_LANGUAGE_NAMES.get(
         request.source_language, request.source_language
     )
-    payload = [
-        {
-            "id": str(segment.id),
-            "start": round(float(segment.start), 3),
-            "end": round(float(segment.end), 3),
-            "text": str(segment.text),
-        }
-        for segment in request.segments
-    ]
+    def serialize(segments: Sequence[Any]) -> str:
+        return json.dumps(
+            [
+                {
+                    "id": str(segment.id),
+                    "start": round(float(segment.start), 3),
+                    "end": round(float(segment.end), 3),
+                    "text": str(segment.text),
+                }
+                for segment in segments
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    context = ""
+    if request.context_before or request.context_after:
+        context = f"""
+Context only (neighbouring subtitles for continuity; do NOT translate or return these IDs):
+Before: {serialize(request.context_before)}
+After: {serialize(request.context_after)}
+"""
     return f"""Translate screen subtitles from {source_name} to natural Simplified Chinese.
 
 Rules:
@@ -147,8 +168,8 @@ Rules:
 - Output only data matching the supplied JSON schema. Do not output timestamps.
 
 Source segments:
-{json.dumps(payload, ensure_ascii=False, separators=(",", ":"))}
-"""
+{serialize(request.segments)}
+{context}"""
 
 
 def parse_translation_payload(
@@ -226,6 +247,7 @@ class CodexCLITranslationProvider(TranslationProvider):
     ) -> None:
         self.codex_path = codex_path
         self.timeout_seconds = timeout_seconds
+        self._login_verified = False
 
     def build_command(
         self, request: TranslationRequest, output_path: Path
@@ -260,13 +282,15 @@ class CodexCLITranslationProvider(TranslationProvider):
         output_path: Path,
         progress: ProgressCallback | None = None,
     ) -> dict[str, Any]:
-        status = codex_environment_status(self.codex_path)
-        if not status.get("ready"):
-            details = status.get("message") or status.get("error") or ""
-            raise TranslationError(
-                "Codex is not logged in with ChatGPT. Run `codex login`, then retry. "
-                + str(details)
-            )
+        if not self._login_verified:
+            status = codex_environment_status(self.codex_path)
+            if not status.get("ready"):
+                details = status.get("message") or status.get("error") or ""
+                raise TranslationError(
+                    "Codex is not logged in with ChatGPT. Run `codex login`, then retry. "
+                    + str(details)
+                )
+            self._login_verified = True
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         # Never let a previous run's result stand in for this one: IDs are only
@@ -332,6 +356,63 @@ def get_translation_provider(name: str) -> TranslationProvider:
     raise TranslationError(f"Unknown translation provider: {name}")
 
 
+def _translate_in_batches(
+    provider: TranslationProvider,
+    segments: list[Any],
+    *,
+    source_language: str,
+    model: str,
+    batch_dir: Path,
+    batch_size: int,
+    progress: ProgressCallback | None,
+) -> dict[str, str]:
+    if batch_size < 1:
+        raise TranslationError("Translation batch size must be at least 1.")
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    starts = list(range(0, len(segments), batch_size))
+    total = len(starts)
+    translations: dict[str, str] = {}
+    for number, start in enumerate(starts, start=1):
+        batch = segments[start : start + batch_size]
+        request = TranslationRequest(
+            tuple(batch),
+            source_language,
+            model,
+            context_before=tuple(segments[max(0, start - TRANSLATION_CONTEXT_CUES) : start]),
+            context_after=tuple(
+                segments[start + len(batch) : start + len(batch) + TRANSLATION_CONTEXT_CUES]
+            ),
+        )
+        label = f"Batch {number}/{total} ({batch[0].id}-{batch[-1].id})"
+
+        def batch_progress(percent: int, message: str, *, _number: int = number) -> None:
+            if progress:
+                overall = 10 + int(80 * ((_number - 1) + min(max(percent, 0), 100) / 100) / total)
+                progress(overall, f"{label}: {message}" if total > 1 else message)
+
+        last_error: TranslationError | None = None
+        for attempt in range(1, TRANSLATION_BATCH_ATTEMPTS + 1):
+            try:
+                payload = provider.translate(
+                    request, batch_dir / f"{number:03d}.result.json", batch_progress
+                )
+                translations.update(parse_translation_payload(payload, batch))
+                last_error = None
+                break
+            except TranslationError as error:
+                last_error = error
+                if progress and attempt < TRANSLATION_BATCH_ATTEMPTS:
+                    progress(
+                        10 + int(80 * (number - 1) / total),
+                        f"{label} failed ({error}); retrying once...",
+                    )
+        if last_error is not None:
+            raise TranslationError(
+                f"{label} failed after {TRANSLATION_BATCH_ATTEMPTS} attempts: {last_error}"
+            ) from last_error
+    return translations
+
+
 def run_translation_project(
     project_dir: Path,
     segments: Sequence[Any],
@@ -341,6 +422,7 @@ def run_translation_project(
     provider_instance: TranslationProvider | None = None,
     source_filename: str = "source.srt",
     progress: ProgressCallback | None = None,
+    batch_size: int = TRANSLATION_BATCH_SIZE,
 ) -> TranslationArtifacts:
     if source_language not in SOURCE_LANGUAGE_NAMES:
         raise TranslationError(f"Unsupported source language: {source_language}")
@@ -387,10 +469,25 @@ def run_translation_project(
         encoding="utf-8",
     )
 
-    request = TranslationRequest(tuple(segments), source_language, model)
     provider = provider_instance or get_translation_provider(provider_name)
-    payload = provider.translate(request, result_json_path, progress)
-    translations = parse_translation_payload(payload, segments)
+    translations = _translate_in_batches(
+        provider,
+        list(segments),
+        source_language=source_language,
+        model=model,
+        batch_dir=project_dir / "translation.batches",
+        batch_size=batch_size,
+        progress=progress,
+    )
+    result_json_path.write_text(
+        json.dumps(
+            {"segments": [{"id": str(s.id), "text": translations[str(s.id)]} for s in segments]},
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     translation_text_path.write_text(
         build_translation_text(segments, translations), encoding="utf-8"
     )

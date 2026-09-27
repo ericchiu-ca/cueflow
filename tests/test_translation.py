@@ -43,6 +43,32 @@ class FakeProvider(TranslationProvider):
         return payload
 
 
+class RecordingProvider(TranslationProvider):
+    """Translates every requested ID; optionally breaks chosen attempts."""
+
+    name = "recording"
+
+    def __init__(self, broken_attempts=()):
+        self.requests = []
+        self.broken_attempts = set(broken_attempts)
+
+    def translate(self, request, output_path, progress=None):
+        self.requests.append(request)
+        if progress:
+            progress(50, "working")
+        items = [{"id": s.id, "text": f"译{s.id}"} for s in request.segments]
+        if len(self.requests) in self.broken_attempts:
+            items = items[:-1]  # drop one ID, as a truncated response would
+        return {"segments": items}
+
+
+def numbered_srt(count):
+    return "".join(
+        f"{index}\n00:{index // 60:02d}:{index % 60:02d},000 --> 00:{index // 60:02d}:{index % 60:02d},500\nLine {index}\n\n"
+        for index in range(1, count + 1)
+    )
+
+
 class TranslationTests(unittest.TestCase):
     def test_payload_requires_exact_unique_nonempty_ids(self):
         segments = parse_srt_text(SOURCE_SRT)
@@ -105,6 +131,53 @@ class TranslationTests(unittest.TestCase):
                 artifacts.translation_text_path.read_text(encoding="utf-8"),
             )
             self.assertEqual(artifacts.segment_count, 2)
+
+    def test_long_input_is_translated_in_batches_with_context(self):
+        segments = parse_srt_text(numbered_srt(250))
+        provider = RecordingProvider()
+        messages = []
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = run_translation_project(
+                Path(directory),
+                segments,
+                source_language="en",
+                provider_instance=provider,
+                batch_size=120,
+                progress=lambda percent, message: messages.append((percent, message)),
+            )
+            result = json.loads(artifacts.result_json_path.read_text(encoding="utf-8"))
+            translated = parse_srt_text(artifacts.zh_srt_path.read_text(encoding="utf-8"))
+
+        self.assertEqual([len(r.segments) for r in provider.requests], [120, 120, 10])
+        self.assertEqual(provider.requests[0].context_before, ())
+        self.assertEqual([s.id for s in provider.requests[1].context_before], ["0118", "0119", "0120"])
+        self.assertEqual([s.id for s in provider.requests[1].context_after], ["0241", "0242", "0243"])
+        self.assertEqual(len(result["segments"]), 250)
+        self.assertEqual(translated[249].text, "译0250")
+        self.assertTrue(any("Batch 2/3 (0121-0240)" in message for _, message in messages))
+        self.assertEqual([p for p, _ in messages], sorted(p for p, _ in messages))
+
+        prompt = build_translation_prompt(provider.requests[1])
+        source_part, context_part = prompt.split("Context only", 1)
+        self.assertIn('"id":"0121"', source_part)
+        self.assertNotIn('"id":"0119"', source_part)
+        self.assertIn('"id":"0119"', context_part)
+
+    def test_invalid_batch_is_retried_once_then_reported(self):
+        segments = parse_srt_text(numbered_srt(5))
+        with tempfile.TemporaryDirectory() as directory:
+            provider = RecordingProvider(broken_attempts={2})
+            artifacts = run_translation_project(
+                Path(directory), segments, source_language="en", provider_instance=provider, batch_size=3
+            )
+            self.assertEqual(len(provider.requests), 3)  # batch 2 needed a retry
+            self.assertIn("译0005", artifacts.zh_srt_path.read_text(encoding="utf-8"))
+
+            provider = RecordingProvider(broken_attempts={2, 3})
+            with self.assertRaisesRegex(TranslationError, r"Batch 2/2 \(0004-0005\) failed after 2 attempts.*Missing"):
+                run_translation_project(
+                    Path(directory), segments, source_language="en", provider_instance=provider, batch_size=3
+                )
 
     def test_codex_command_is_read_only_and_model_selectable(self):
         segments = tuple(parse_srt_text(SOURCE_SRT))
