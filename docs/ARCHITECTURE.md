@@ -86,11 +86,15 @@ flowchart TD
 
 高级 ASR 使用两个内部 JSON protocol：`cueflow-vad-v1` 与 `cueflow-mlx-batch-v1`。它们是进程间接口，但没有独立版本兼容文档或 contract tests。
 
+ASR 检查点的键包含音频内容、语言、initial prompt、MLX worker 源码及模型文件内容摘要。每次 batch 递归读取模型目录的非隐藏文件（包括权重和配置），每个 batch 只扫描一次；不使用文件名或 size/mtime 判断权重身份。隐藏下载缓存不参与。摘要不包含模型绝对路径，相同内容可以在迁移目录后复用。旧版键不会命中；这会增加模型文件读取成本，并让旧检查点在第一次续跑时重算。运行期间应保持模型文件不变。该指纹不冻结外部 MLX/Python 依赖版本。
+
 ### 翻译边界
 
 `translation.py` 把每段的 `id`、`start`、`end`、`text`，连同源语言和所选模型交给 Codex。Codex 在空临时目录中以 `--ephemeral --ignore-user-config --ignore-rules --sandbox read-only --skip-git-repo-check` 运行，并用仓库内 JSON Schema 限制输出。长字幕按每批 120 条分多次请求，每批附带前后各 3 条原文作为只读上下文（同样是字幕段数据，不要求翻译或返回）；每批单独校验 ID，失败重试一次，最终合并写入 `translation.result.json`，各批原始结果保存在 `translation.batches/`。每批校验通过后写入带输入指纹的检查点，失败后在同一项目中重跑（CLI 同一输出目录，或 Web 的“重试”）只复用指纹一致的批次。
 
 项目保留 `source.srt`、`master.json`、`translation_input.txt`、`translation.result.json`、`translation_zh.txt` 与 `output/zh.srt`。`openai-api` provider 当前明确报错，不读取 API key 或发起 API 请求。
+
+翻译检查点采用版本化摘要：完整实际 prompt（含正文、起止时间、前后上下文和规则）、输出 Schema 内容、模型选择及 provider 名称都必须匹配。上下文变更会使相邻受影响批次也重算，其余批次仍可复用。旧版检查点自动失效，无须手动删除。摘要记录模型选择，不识别 `auto` 最终解析的云端模型版本；远端模型更新、外部 CLI 和依赖升级仍需人工管理。
 
 ### Web 任务与文件生命周期
 

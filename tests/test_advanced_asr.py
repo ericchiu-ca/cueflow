@@ -380,7 +380,7 @@ class TestAdvancedAsr(unittest.TestCase):
         import sys
         import wave
 
-        from subflow.advanced_asr import _batch_results
+        from subflow.advanced_asr import _batch_results, _inference_fingerprint
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -412,9 +412,12 @@ class TestAdvancedAsr(unittest.TestCase):
 
             environment = dict(os.environ, PYTHONPATH=str(fake))
             checkpoint = root / "ckpt" / "turbo.jsonl"
-            results = _batch_results(
-                Path(sys.executable), root / "model", items, environment, checkpoint=checkpoint
-            )
+            with patch("subflow.advanced_asr._inference_fingerprint", wraps=_inference_fingerprint) as fingerprint:
+                results = _batch_results(
+                    Path(sys.executable), root / "model", items, environment, checkpoint=checkpoint
+                )
+            # Model files are hashed once for all four clips and both attempts.
+            fingerprint.assert_called_once()
 
             self.assertEqual({key: value["result"]["text"] for key, value in results.items()},
                              {str(i): f"clip-{i}.wav" for i in range(1, 5)})
@@ -427,6 +430,72 @@ class TestAdvancedAsr(unittest.TestCase):
             again = _batch_results(Path("/nonexistent/python"), root / "model", items, environment, checkpoint=checkpoint)
             self.assertEqual(len(again), 4)
             self.assertFalse(log.exists())
+
+    def test_asr_resume_invalidates_model_contents_and_initial_prompt(self):
+        import os
+        import sys
+        import wave
+
+        from subflow.advanced_asr import _batch_results
+
+        for change in ("same_name_model", "weights", "config", "initial_prompt", "legacy_checkpoint", "relocated_model"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                model = root / "first" / "model"
+                model.mkdir(parents=True)
+                (model / "weights.npz").write_bytes(b"old-weights")
+                (model / "config.json").write_text("old-config")
+                fake = root / "modules"
+                fake.mkdir()
+                log = root / "calls.log"
+                (fake / "mlx_whisper.py").write_text(
+                    "from pathlib import Path\n"
+                    f"LOG = Path({str(log)!r})\n"
+                    "def transcribe(path, **kwargs):\n"
+                    "    with LOG.open('a') as handle: handle.write('called\\n')\n"
+                    "    model = Path(kwargs['path_or_hf_repo'])\n"
+                    "    return {'text': (model/'weights.npz').read_text() + "
+                    "(model/'config.json').read_text() + kwargs.get('initial_prompt', ''), 'segments': []}\n"
+                )
+                clip = root / "clip.wav"
+                with wave.open(str(clip), "wb") as audio:
+                    audio.setnchannels(1)
+                    audio.setsampwidth(2)
+                    audio.setframerate(16000)
+                    audio.writeframes(b"\x01\x00" * 1600)
+                items = [{"id": "1", "audio_path": str(clip), "language": "en"}]
+                checkpoint = root / "checkpoint.jsonl"
+                environment = dict(os.environ, PYTHONPATH=str(fake))
+                original = _batch_results(Path(sys.executable), model, items, environment, checkpoint=checkpoint)
+                if change in ("same_name_model", "relocated_model"):
+                    model = root / "second" / "model"
+                    model.mkdir(parents=True)
+                    (model / "weights.npz").write_bytes(b"new-weights" if change == "same_name_model" else b"old-weights")
+                    (model / "config.json").write_text("old-config")
+                elif change == "legacy_checkpoint":
+                    import hashlib
+                    import json
+
+                    old_key = hashlib.sha256(f"{model.name}\0en\0".encode() + clip.read_bytes()).hexdigest()
+                    checkpoint.write_text(json.dumps({"key": old_key, "id": "1", "result": {"text": "stale"}}) + "\n")
+                elif change in ("weights", "config"):
+                    changed_file = model / ("weights.npz" if change == "weights" else "config.json")
+                    before = changed_file.stat()
+                    changed_file.write_bytes(b"new-weights" if change == "weights" else b"new-config")
+                    # Same size and mtime: metadata alone cannot identify weights.
+                    os.utime(changed_file, ns=(before.st_atime_ns, before.st_mtime_ns))
+                else:
+                    items[0]["initial_prompt"] = "Updated terminology"
+                changed = _batch_results(Path(sys.executable), model, items, environment, checkpoint=checkpoint)
+                if change not in ("legacy_checkpoint", "relocated_model"):
+                    self.assertNotEqual(original["1"]["result"]["text"], changed["1"]["result"]["text"])
+                self.assertNotEqual(changed["1"]["result"]["text"], "stale")
+                expected_calls = ["called"] if change == "relocated_model" else ["called", "called"]
+                self.assertEqual(log.read_text().splitlines(), expected_calls)
+                # Unchanged work can still resume, without an available worker.
+                reused = _batch_results(Path("/missing/python"), model, items, environment, checkpoint=checkpoint)
+                self.assertEqual(reused["1"]["result"], changed["1"]["result"])
+                self.assertEqual(log.read_text().splitlines(), expected_calls)
 
     def test_worker_timeout_is_reported_as_runtime_error(self):
         import sys

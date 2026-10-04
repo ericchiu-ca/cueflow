@@ -105,6 +105,18 @@ cueflow burn --help
 
 仓库中没有 JUnit artifact、coverage artifact 或 release verification record。公开历史从当前快照开始；更早代码状态及其测试结果**无法从本仓库确认**。
 
+2026-10-03（America/Toronto），`codex/cache-input-fingerprints` 基于 `895476a` 的本地复核：
+
+- Python 3.11.15、3.12.15 各 111/111 通过；修改涉及的四份 Python 文件 `ruff check` 通过。
+- 四个新增测试方法在原代码上失败，确认覆盖了真实缓存复用问题；修复后通过。覆盖时间与相邻上下文、prompt/Schema、旧翻译检查点、同名模型、权重/配置原地更新和 initial prompt；既有崩溃续跑测试同时检查模型摘要每批只计算一次。
+- 模型内容变化测试保持文件 size/mtime 不变；相同模型文件迁移到另一目录仍可复用；旧 ASR 缓存键不会命中。
+- wheel 构建后在独立 venv、仓库目录外核对字体、Schema、网页文件和 CLI（不安装运行时依赖，不等同于完整安装依赖验证）。
+- 真实本地 Turbo MLX worker 处理 macOS 合成语音，生成两段字幕；随后使用不存在的 worker Python 仍可从检查点获得相同结果。首次约 7.49 s、续跑约 0.63 s，包含模型内容摘要计算。源 WAV SHA-256：`d314224b923116ecb160fb53ae9db52e491ac49770761a2bc4495ebdcfd3ead4`。
+- 该 smoke 的外部 worker 环境：Python 3.12.15、MLX 0.32.1、mlx-whisper 0.4.3、NumPy 2.5.2。
+- 这项真实 smoke 仅覆盖 Turbo worker 和检查点复用；未运行 VAD、full large-v3、WhisperX 对齐、Codex 云端翻译或压制。ASR 把合成语音中的 CueFlow 识别为 Qflow，不能把运行成功当作识别质量验收。
+
+本次改动没有新的 GitHub CI 结果；已有 #1–#4 的成功状态属于其各自旧提交。完整交接见 [HANDOFF.md](HANDOFF.md)。
+
 ## CI 覆盖范围
 
 `.github/workflows/tests.yml` 在以下事件运行：

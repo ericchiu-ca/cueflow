@@ -2,6 +2,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,6 +16,7 @@ from subflow.translation import (
     build_translation_prompt,
     parse_translation_payload,
     run_translation_project,
+    TRANSLATION_SCHEMA,
 )
 
 
@@ -220,12 +222,12 @@ class TranslationTests(unittest.TestCase):
             self.assertEqual([r.segments[0].id for r in resumed.requests], ["0004", "0007"])
             self.assertTrue(any("Batch 1/3 reused" in m for m in messages))
 
-            # Changing the source text invalidates that batch's checkpoint.
+            # Changed text also invalidates batches that receive it as context.
             edited = list(segments)
             edited[0] = type(edited[0])(edited[0].id, edited[0].start, edited[0].end, "Changed", [])
             again = RecordingProvider()
             run_translation_project(project, edited, source_language="en", provider_instance=again, batch_size=3)
-            self.assertEqual([r.segments[0].id for r in again.requests], ["0001"])
+            self.assertEqual([r.segments[0].id for r in again.requests], ["0001", "0004"])
 
             # A different model must not reuse any batch.
             other_model = RecordingProvider()
@@ -233,6 +235,72 @@ class TranslationTests(unittest.TestCase):
                 project, segments, source_language="en", model="gpt-5.6-sol", provider_instance=other_model, batch_size=3
             )
             self.assertEqual(len(other_model.requests), 3)
+
+    def test_rerun_invalidates_timing_and_neighbour_context(self):
+        segments = parse_srt_text(numbered_srt(12))
+        cases = {
+            "duration": replace(segments[3], end=segments[3].end + 0.2),
+            "text": replace(segments[3], text="Changed neighbouring context"),
+        }
+        for name, changed in cases.items():
+            with self.subTest(change=name), tempfile.TemporaryDirectory() as directory:
+                project = Path(directory)
+                run_translation_project(
+                    project, segments, "en", provider_instance=RecordingProvider(), batch_size=3
+                )
+                edited = list(segments)
+                edited[3] = changed
+                rerun = RecordingProvider()
+                run_translation_project(project, edited, "en", provider_instance=rerun, batch_size=3)
+                # Cue 4 is batch 2's input, batch 1's following context and
+                # batch 3's preceding context. Batch 4 is unaffected.
+                self.assertEqual([r.segments[0].id for r in rerun.requests], ["0001", "0004", "0007"])
+                unchanged = RecordingProvider()
+                run_translation_project(project, edited, "en", provider_instance=unchanged, batch_size=3)
+                self.assertEqual(unchanged.requests, [])
+
+    def test_rerun_invalidates_prompt_and_schema_changes(self):
+        segments = parse_srt_text(SOURCE_SRT)
+        for change in ("prompt", "schema"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                project = Path(directory)
+                run_translation_project(project, segments, "en", provider_instance=RecordingProvider())
+                rerun = RecordingProvider()
+                if change == "prompt":
+                    original = build_translation_prompt
+                    replacement = patch(
+                        "subflow.translation.build_translation_prompt",
+                        side_effect=lambda request: original(request) + "\nUse the revised terminology guide.\n",
+                    )
+                else:
+                    schema = project / "revised.schema.json"
+                    schema.write_bytes(TRANSLATION_SCHEMA.read_bytes() + b"\n")
+                    replacement = patch("subflow.translation.TRANSLATION_SCHEMA", schema)
+                with replacement:
+                    run_translation_project(project, segments, "en", provider_instance=rerun)
+                self.assertEqual(len(rerun.requests), 1)
+
+    def test_legacy_translation_checkpoint_is_not_reused(self):
+        import hashlib
+
+        segments = parse_srt_text(SOURCE_SRT)
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            batches = project / "translation.batches"
+            batches.mkdir()
+            legacy_material = json.dumps(
+                {"source_language": "en", "model": "gpt-5.6-terra", "provider": "recording",
+                 "segments": [[s.id, s.text] for s in segments]},
+                ensure_ascii=False, sort_keys=True,
+            )
+            (batches / "001.checkpoint.json").write_text(json.dumps({
+                "fingerprint": hashlib.sha256(legacy_material.encode("utf-8")).hexdigest(),
+                "segments": [{"id": s.id, "text": "旧译文"} for s in segments],
+            }))
+            provider = RecordingProvider()
+            artifacts = run_translation_project(project, segments, "en", provider_instance=provider)
+            self.assertEqual(len(provider.requests), 1)
+            self.assertNotIn("旧译文", artifacts.zh_srt_path.read_text())
 
     def test_codex_command_is_read_only_and_model_selectable(self):
         segments = tuple(parse_srt_text(SOURCE_SRT))

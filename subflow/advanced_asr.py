@@ -184,9 +184,48 @@ def _write_clips(source: Path, windows: list[dict], directory: Path) -> list[Pat
     return clips
 
 
-def _clip_key(model: Path, item: dict) -> str:
+def _inference_fingerprint(model: Path) -> str:
+    """Hash model contents once per batch; never persist its absolute path.
+
+    Download bookkeeping in hidden directories is not inference input. All
+    other model files, including configuration and weights, are read in full.
+    Do not memoize by size/mtime: same-sized replacement weights can retain both.
+    """
+    if not model.is_dir():
+        raise RuntimeError(f"MLX model directory does not exist: {model}")
+    files = []
+    for path in sorted(model.rglob("*")):
+        relative = path.relative_to(model)
+        if any(part.startswith(".") for part in relative.parts) or not path.is_file():
+            continue
+        with path.open("rb") as handle:
+            files.append([relative.as_posix(), hashlib.file_digest(handle, "sha256").hexdigest()])
+    material = json.dumps(
+        {
+            "version": 2,
+            "protocol": MLX_PROTOCOL,
+            "model_files": files,
+            "worker_sha256": hashlib.sha256(
+                Path(__file__).with_name("mlx_batch_runner.py").read_bytes()
+            ).hexdigest(),
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _clip_key(model: Path, item: dict, *, inference_fingerprint: str | None = None) -> str:
     digest = hashlib.sha256()
-    digest.update(f"{model.name}\0{item.get('language', 'auto')}\0".encode("utf-8"))
+    material = json.dumps(
+        {
+            "inference": inference_fingerprint or _inference_fingerprint(model),
+            "language": str(item.get("language", "auto")),
+            "initial_prompt": str(item.get("initial_prompt", "")).strip(),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    digest.update(material.encode("utf-8") + b"\0")
     with open(item["audio_path"], "rb") as handle:
         for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
@@ -218,10 +257,16 @@ def _batch_results(
 ) -> dict[str, dict]:
     """Run a batch, resuming from `checkpoint` after a crash or timeout.
 
-    Finished clips are keyed by audio content, model and language, so only
-    identical work is ever reused.
+    Finished clips are keyed by audio, model contents, worker implementation,
+    language and initial prompt. Old keys are ignored and recomputed.
     """
-    keyed = [dict(item, key=_clip_key(model, item)) for item in items]
+    if not items:
+        return {}
+    inference_fingerprint = _inference_fingerprint(model)
+    keyed = [
+        dict(item, key=_clip_key(model, item, inference_fingerprint=inference_fingerprint))
+        for item in items
+    ]
     results: dict[str, dict] = {}
     last_error: RuntimeError | None = None
     for _attempt in range(BATCH_WORKER_ATTEMPTS):

@@ -367,14 +367,16 @@ def get_translation_provider(name: str) -> TranslationProvider:
 
 
 def _batch_fingerprint(
-    batch: Sequence[Any], *, source_language: str, model: str, provider: str
+    request: TranslationRequest, *, provider: str
 ) -> str:
+    """Match the actual prompt and output contract, including neighbouring cues."""
     material = json.dumps(
         {
-            "source_language": source_language,
-            "model": model,
+            "version": 2,
+            "model": request.model,
             "provider": provider,
-            "segments": [[str(s.id), str(s.text)] for s in batch],
+            "prompt": build_translation_prompt(request),
+            "schema_sha256": hashlib.sha256(TRANSLATION_SCHEMA.read_bytes()).hexdigest(),
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -415,10 +417,17 @@ def _translate_in_batches(
     reused = 0
     for number, start in enumerate(starts, start=1):
         batch = segments[start : start + batch_size]
-        checkpoint = batch_dir / f"{number:03d}.checkpoint.json"
-        fingerprint = _batch_fingerprint(
-            batch, source_language=source_language, model=model, provider=provider.name
+        request = TranslationRequest(
+            tuple(batch),
+            source_language,
+            model,
+            context_before=tuple(segments[max(0, start - TRANSLATION_CONTEXT_CUES) : start]),
+            context_after=tuple(
+                segments[start + len(batch) : start + len(batch) + TRANSLATION_CONTEXT_CUES]
+            ),
         )
+        checkpoint = batch_dir / f"{number:03d}.checkpoint.json"
+        fingerprint = _batch_fingerprint(request, provider=provider.name)
         restored = _load_checkpoint(checkpoint, fingerprint, batch)
         if restored is not None:
             # Resuming a failed or interrupted run: this batch already passed
@@ -432,15 +441,6 @@ def _translate_in_batches(
                     f"Batch {number}/{total} reused from a previous run",
                 )
             continue
-        request = TranslationRequest(
-            tuple(batch),
-            source_language,
-            model,
-            context_before=tuple(segments[max(0, start - TRANSLATION_CONTEXT_CUES) : start]),
-            context_after=tuple(
-                segments[start + len(batch) : start + len(batch) + TRANSLATION_CONTEXT_CUES]
-            ),
-        )
         label = f"Batch {number}/{total} ({batch[0].id}-{batch[-1].id})"
 
         def batch_progress(stage: str, percent: int, message: str, *, _number: int = number) -> None:
