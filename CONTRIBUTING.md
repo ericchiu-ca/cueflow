@@ -50,6 +50,8 @@ python3.11 -m pip wheel . --no-deps --no-build-isolation -w dist
 git diff --check
 ```
 
+前端修改还应执行 `npm ci --ignore-scripts`、`npx --no-install playwright install chromium`、`npm run check:ui` 和 `npm run test:browser`；渲染修改执行 `python -m scripts.render_smoke --output /tmp/cueflow-render-check`。仅开发/CI 需要 Node.js 22。
+
 HTTP 安全测试会绑定 `127.0.0.1` 的临时端口；受限执行环境可能阻止该操作。若出现 `PermissionError: [Errno 1] Operation not permitted`，应在允许本机 loopback 的环境重跑，不能把它记录成通过。
 
 ASR、WhisperX、Codex、FFmpeg/libass 和 VideoToolbox 修改还需要按 [测试指南](docs/TESTING.md) 的人工清单使用获授权的测试媒体验证，并记录工具版本、输入 hash、命令、输出和人工结论。

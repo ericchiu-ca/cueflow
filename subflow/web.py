@@ -29,6 +29,9 @@ from .bilingual import (
     render_bilingual_preview,
 )
 from . import proc
+from .job_store import ACTIVE, JobStore
+from .settings import Settings, describe_settings, resource_context
+from .provenance import write_provenance
 from .core import build_srt_text, parse_srt_text, save_master_json, track_pairing
 from .review import (
     MAX_CHARS_BY_TRACK,
@@ -43,6 +46,7 @@ from .transcription import (
     _portable_metadata,
     find_whisperx_python,
     resolve_large_model_path,
+    resolve_mlx_paths,
     safe_filename,
     transcribe_media,
     whisperx_version,
@@ -65,7 +69,9 @@ DEFAULT_FRAMELEDGER_MODEL = (
     / "models"
     / "whisper-large-v3-turbo"
 )
-VIDEO_EXTENSIONS = frozenset({".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm"})
+VIDEO_EXTENSIONS = frozenset(
+    {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm"}
+)
 ENCODING_PROFILES = ("hevc-source", "hevc", "h264", "quality", "fast")
 MANAGED_PROJECT_CATEGORIES = frozenset(
     {"transcriptions", "translations", "bilingual", "reviews", "ass-assets", "renders"}
@@ -119,6 +125,7 @@ class JobManager:
         model_path: str | Path | None,
         helper_path: str | Path | None,
         whisperx_python: str | Path | None,
+        config_path: str | Path | None = None,
     ) -> None:
         self.output_root = Path(output_root).expanduser().absolute()
         self.output_root.mkdir(parents=True, exist_ok=True)
@@ -126,8 +133,10 @@ class JobManager:
         self.model_path = model_path
         self.helper_path = helper_path
         self.whisperx_python = whisperx_python
+        self.settings = Settings(config_path)
+        self.store = JobStore(self.output_root)
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cueflow")
-        self.jobs: dict[str, dict] = {}
+        self.jobs, self.restore_warnings = self.store.load()
         self.ass_assets: dict[str, Path] = {}
         self.review_sessions: dict[str, dict] = {}
         self.lock = threading.Lock()
@@ -136,12 +145,17 @@ class JobManager:
         # (uploads, ASS/review creation, review saves); cleanup waits for none.
         self._active_operations = 0
         self._cleaning = False
+        self._events: dict[str, threading.Event] = {}
+        self._futures: dict[str, object] = {}
+        self._closing = False
 
     @contextmanager
     def operation(self):
         with self.lock:
             if self._cleaning:
-                raise ValueError("Local files are being cleaned up. Try again in a moment.")
+                raise ValueError(
+                    "Local files are being cleaned up. Try again in a moment."
+                )
             self._active_operations += 1
         try:
             yield
@@ -196,12 +210,14 @@ class JobManager:
         return files, total_bytes
 
     def cleanup_local_files(self) -> dict:
-        active_statuses = {"uploading", "queued", "running"}
+        active_statuses = ACTIVE
         with self.lock:
             if self._cleaning:
                 raise ValueError("Local file cleanup is already running.")
             active_jobs = [
-                job for job in self.jobs.values() if job.get("status") in active_statuses
+                job
+                for job in self.jobs.values()
+                if job.get("status") in active_statuses
             ]
             if active_jobs:
                 raise ValueError(
@@ -247,7 +263,9 @@ class JobManager:
             "freed_bytes": freed_bytes,
         }
 
-    def _create_job(self, identifier: str, kind: str, project: Path, **metadata: object) -> dict:
+    def _create_job(
+        self, identifier: str, kind: str, project: Path, **metadata: object
+    ) -> dict:
         job = {
             "id": identifier,
             "kind": kind,
@@ -259,19 +277,35 @@ class JobManager:
             "error": None,
             "download_url": None,
             "download_name": None,
+            "created_at": datetime.now().astimezone().isoformat(),
             **metadata,
         }
         with self.lock:
             self.jobs[identifier] = job
+            self._persist_locked(job)
         return dict(job)
+
+    def _persist_locked(self, job: dict) -> None:
+        project = Path(job["project"])
+        if (
+            project.resolve().parent.parent == self.output_root.resolve()
+            and project.parent.name in MANAGED_PROJECT_CATEGORIES
+        ):
+            self.store.save(job)
 
     def _update(self, identifier: str, **changes: object) -> None:
         with self.lock:
             if identifier in self.jobs:
                 self.jobs[identifier].update(changes)
+                self.jobs[identifier]["updated_at"] = (
+                    datetime.now().astimezone().isoformat()
+                )
+                self._persist_locked(self.jobs[identifier])
 
     def mark_upload_failed(self, identifier: str) -> None:
-        self._update(identifier, status="failed", stage="failed", message="Upload failed")
+        self._update(
+            identifier, status="failed", stage="failed", message="Upload failed"
+        )
         snapshot = self.snapshot(identifier)
         if snapshot:
             self.discard_project(Path(snapshot["project"]))
@@ -281,7 +315,78 @@ class JobManager:
             job = self.jobs.get(identifier)
             return dict(job) if job else None
 
-    def prepare_transcription_upload(self, filename: str, language: str, alignment: str) -> tuple[dict, Path]:
+    def list_jobs(self) -> dict:
+        with self.lock:
+            jobs = sorted(
+                (dict(j) for j in self.jobs.values()),
+                key=lambda j: j.get("created_at", ""),
+                reverse=True,
+            )
+        return {"jobs": jobs, "warnings": self.restore_warnings}
+
+    def cancel_job(self, identifier: str) -> dict:
+        with self.lock:
+            job = self.jobs.get(identifier)
+            if job is None:
+                raise ValueError("Task not found.")
+            if job["status"] not in {"resuming", "queued", "running", "cancelling"}:
+                return dict(job)
+            event = self._events.get(identifier)
+            if event is not None:
+                event.set()  # completion and cancellation are serialized by the task lock
+            future = self._futures.get(identifier)
+            queued = job["status"] in {"resuming", "queued"}
+            job.update(
+                status="cancelled" if queued else "cancelling",
+                stage="cancelled" if queued else "cancelling",
+                message="Cancelled; input files and completed checkpoints were kept.",
+            )
+            self._persist_locked(job)
+            snapshot = dict(job)
+        if event is not None:
+            proc.cancel(event)
+        if queued and future is not None:
+            future.cancel()
+        return snapshot
+
+    def close(self) -> None:
+        with self.lock:
+            self._closing = True
+            events = list(self._events.values())
+            for job in self.jobs.values():
+                if job["status"] in ACTIVE:
+                    job.update(
+                        status="interrupted",
+                        stage="interrupted",
+                        message="Service stopped; resume this task when ready.",
+                    )
+                    self._persist_locked(job)
+        for event in events:
+            proc.cancel(event)
+        self.executor.shutdown(wait=False, cancel_futures=True)
+
+    def configuration(self) -> dict:
+        return describe_settings(
+            self.settings,
+            {
+                "model_path": self.model_path,
+                "helper_path": self.helper_path,
+                "whisperx_python": self.whisperx_python,
+            },
+        )
+
+    def update_configuration(self, resources: object) -> dict:
+        with self.lock:
+            if any(j["status"] in ACTIVE for j in self.jobs.values()):
+                raise ValueError(
+                    "Wait for active tasks to finish before changing resource settings."
+                )
+            self.settings.save(resources)
+        return self.configuration()
+
+    def prepare_transcription_upload(
+        self, filename: str, language: str, alignment: str
+    ) -> tuple[dict, Path]:
         identifier = uuid.uuid4().hex
         cleaned = safe_filename(filename)
         if Path(cleaned).suffix.lower() not in SUPPORTED_EXTENSIONS:
@@ -297,6 +402,8 @@ class JobManager:
             project,
             language=language,
             alignment_requested=alignment,
+            media_path=str(media),
+            source_name=cleaned,
         )
         return job, media
 
@@ -308,34 +415,120 @@ class JobManager:
         queued_message: str,
         failure_message: str,
         running: dict | None = None,
+        expected_attempt: str | None = None,
     ) -> None:
         """Queue `work(report, project) -> completion fields` with shared bookkeeping."""
-        self._update(identifier, status="queued", stage="queued", percent=1, message=queued_message)
+        try:
+            settings = self.settings.load()
+        except ValueError as error:
+            self._update(
+                identifier,
+                status="failed",
+                stage="failed",
+                error=str(error),
+                message="Repair local configuration before starting this task.",
+            )
+            raise
+        event = threading.Event()
+        with self.lock:
+            if self._closing:
+                raise RuntimeError("The local service is stopping.")
+            if self.jobs[identifier]["status"] == "cancelled":
+                return
+            if (
+                expected_attempt is not None
+                and self.jobs[identifier].get("attempt_id") != expected_attempt
+            ):
+                return
+            self._events[identifier] = event
+            self.jobs[identifier].update(
+                status="queued", stage="queued", percent=1, message=queued_message
+            )
+            self._persist_locked(self.jobs[identifier])
 
         def run() -> None:
-            self._update(identifier, status="running", **(running or {}))
+            def update(**changes) -> None:
+                with self.lock:
+                    if self._events.get(identifier) is not event:
+                        raise proc.CancelledError(
+                            "This task attempt has been replaced."
+                        )
+                    if event.is_set() or self._closing:
+                        raise proc.CancelledError("Task cancelled.")
+                    self.jobs[identifier].update(
+                        changes, updated_at=datetime.now().astimezone().isoformat()
+                    )
+                    self._persist_locked(self.jobs[identifier])
 
             def report(stage: str, percent: int, message: str) -> None:
-                self._update(identifier, stage=stage, percent=percent, message=message)
+                proc.check_cancelled()
+                update(stage=stage, percent=percent, message=message)
 
             try:
-                snapshot = self.snapshot(identifier)
-                if snapshot is None:
-                    raise RuntimeError("Job disappeared from the local queue.")
-                completed = work(report, Path(snapshot["project"]))
-                self._update(identifier, status="complete", stage="complete", percent=100, **completed)
+                with proc.cancellation_scope(event), resource_context(settings):
+                    update(status="running", **(running or {}))
+                    snapshot = self.snapshot(identifier)
+                    if snapshot is None:
+                        raise RuntimeError("Job disappeared from the local queue.")
+                    completed = work(report, Path(snapshot["project"]))
+                    proc.check_cancelled()
+                    update(
+                        status="complete", stage="complete", percent=100, **completed
+                    )
             except Exception as error:
-                self._update(
-                    identifier,
-                    status="failed",
-                    stage="failed",
-                    message=failure_message,
-                    error=str(error),
-                )
+                cancelled = event.is_set()
+                with self.lock:
+                    if self._events.get(identifier) is not event:
+                        return
+                    self.jobs[identifier].update(
+                        status="interrupted"
+                        if self._closing
+                        else "cancelled"
+                        if cancelled
+                        else "failed",
+                        stage="interrupted"
+                        if self._closing
+                        else "cancelled"
+                        if cancelled
+                        else "failed",
+                        message="Service stopped; resume this task when ready."
+                        if self._closing
+                        else "Cancelled; completed checkpoints were kept."
+                        if cancelled
+                        else failure_message,
+                        error=None if cancelled else str(error),
+                    )
+                    self._persist_locked(self.jobs[identifier])
 
-        self.executor.submit(run)
+        with self.lock:
+            if (
+                self._events.get(identifier) is not event
+                or event.is_set()
+                or self._closing
+            ):
+                if self._events.get(identifier) is event:
+                    self._events.pop(identifier, None)
+                return
+            future = self.executor.submit(run)
+            self._futures[identifier] = future
 
-    def start_transcription(self, identifier: str, media: Path, language: str, alignment: str) -> None:
+        def release_attempt(_future) -> None:
+            with self.lock:
+                if self._events.get(identifier) is event:
+                    self._events.pop(identifier, None)
+                    self._futures.pop(identifier, None)
+
+        future.add_done_callback(release_attempt)
+
+    def start_transcription(
+        self,
+        identifier: str,
+        media: Path,
+        language: str,
+        alignment: str,
+        *,
+        expected_attempt: str | None = None,
+    ) -> None:
         def work(report, project: Path) -> dict:
             result = transcribe_media(
                 media,
@@ -374,6 +567,7 @@ class JobManager:
             work,
             queued_message="Queued for local transcription",
             failure_message="Transcription failed",
+            expected_attempt=expected_attempt,
         )
 
     def create_translation_job(
@@ -396,6 +590,7 @@ class JobManager:
 
         identifier = uuid.uuid4().hex
         project = self._project_dir("translations", source_filename, identifier)
+        _write_text_atomic(project / "source.srt", build_srt_text(segments))
         self._create_job(
             identifier,
             "translation",
@@ -405,7 +600,9 @@ class JobManager:
             provider=provider,
             model=model,
         )
-        self._submit_translation(identifier, segments, source_filename, source_language, model, provider)
+        self._submit_translation(
+            identifier, segments, source_filename, source_language, model, provider
+        )
         snapshot = self.snapshot(identifier)
         if snapshot is None:
             raise RuntimeError("Could not create the translation job.")
@@ -413,24 +610,90 @@ class JobManager:
 
     def retry_translation(self, identifier: str) -> dict:
         """Re-run a failed translation in its project, reusing validated batches."""
-        job = self.snapshot(identifier)
-        if job is None or job.get("kind") != "translation":
-            raise ValueError("Translation job not found.")
-        if job.get("status") != "failed":
-            raise ValueError("Only a failed translation can be retried.")
-        source = Path(job["project"]) / "source.srt"
-        if not source.is_file():
-            raise ValueError("The original subtitles are no longer available; start a new translation.")
-        segments = parse_srt_text(source.read_text(encoding="utf-8"))
-        self._update(identifier, error=None, warnings=[])
-        self._submit_translation(
-            identifier,
-            segments,
-            str(job.get("source_name") or "source.srt"),
-            str(job["source_language"]),
-            str(job["model"]),
-            str(job["provider"]),
-        )
+        return self.resume_job(identifier, translation_only=True)
+
+    def resume_job(self, identifier: str, *, translation_only: bool = False) -> dict:
+        with self.lock:
+            job = self.jobs.get(identifier)
+            if job is None or (translation_only and job.get("kind") != "translation"):
+                raise ValueError(
+                    "Translation job not found."
+                    if translation_only
+                    else "Task not found."
+                )
+            if job["status"] in {"resuming", "queued", "running", "cancelling"}:
+                return dict(
+                    job
+                )  # repeated clicks and concurrent requests share the same execution
+            if job["status"] not in {"failed", "interrupted", "cancelled"}:
+                raise ValueError(
+                    "Only a failed, interrupted or cancelled task can be resumed."
+                )
+            job.update(
+                status="resuming",
+                stage="queued",
+                error=None,
+                warnings=[],
+                attempt_id=uuid.uuid4().hex,
+            )
+            self._persist_locked(job)
+            job = dict(job)
+        try:
+            project = Path(job["project"])
+            if job["kind"] == "translation":
+                source = project / "source.srt"
+                if not source.is_file():
+                    raise ValueError(
+                        "The original subtitles are no longer available; start a new translation."
+                    )
+                segments = parse_srt_text(source.read_text(encoding="utf-8"))
+                self._submit_translation(
+                    identifier,
+                    segments,
+                    str(job.get("source_name") or "source.srt"),
+                    str(job["source_language"]),
+                    str(job["model"]),
+                    str(job["provider"]),
+                    expected_attempt=job["attempt_id"],
+                )
+            else:
+                media = Path(job.get("media_path", ""))
+                if not media.is_file():
+                    raise ValueError(
+                        "The uploaded media is incomplete or missing; upload it again."
+                    )
+                if job["kind"] == "transcription":
+                    self.start_transcription(
+                        identifier,
+                        media,
+                        str(job["language"]),
+                        str(job["alignment_requested"]),
+                        expected_attempt=job["attempt_id"],
+                    )
+                elif job["kind"] == "burn":
+                    self.start_burn(
+                        identifier,
+                        media,
+                        str(job["profile"]),
+                        expected_attempt=job["attempt_id"],
+                    )
+                else:
+                    raise ValueError("Unsupported task kind.")
+        except Exception as error:
+            with self.lock:
+                current = self.jobs[identifier]
+                if (
+                    current.get("attempt_id") == job["attempt_id"]
+                    and current["status"] == "resuming"
+                ):
+                    current.update(
+                        status="failed",
+                        stage="failed",
+                        error=str(error),
+                        message="Could not resume task.",
+                    )
+                    self._persist_locked(current)
+            raise
         snapshot = self.snapshot(identifier)
         if snapshot is None:
             raise RuntimeError("Could not requeue the translation job.")
@@ -444,6 +707,8 @@ class JobManager:
         source_language: str,
         model: str,
         provider: str,
+        *,
+        expected_attempt: str | None = None,
     ) -> None:
         def work(report, project: Path) -> dict:
             artifacts = run_translation_project(
@@ -474,10 +739,17 @@ class JobManager:
             work,
             queued_message="Queued for subtitle translation",
             failure_message="Translation failed",
-            running={"stage": "translation", "percent": 8, "message": "Preparing stable subtitle IDs"},
+            expected_attempt=expected_attempt,
+            running={
+                "stage": "translation",
+                "percent": 8,
+                "message": "Preparing stable subtitle IDs",
+            },
         )
 
-    def create_ass(self, source_name: str, source_text: str, chinese_name: str, chinese_text: str) -> dict:
+    def create_ass(
+        self, source_name: str, source_text: str, chinese_name: str, chinese_text: str
+    ) -> dict:
         # Validate and build in memory first: a rejected pair (count mismatch,
         # timeline drift) must not leave an empty project directory behind.
         source_segments = parse_srt_text(source_text)
@@ -500,7 +772,7 @@ class JobManager:
             preview_url = None
             preview_error = None
             try:
-                render_bilingual_preview(
+                self._render_preview(
                     preview_path,
                     source_text=source_segments[0].text,
                     chinese_text=chinese_segments[0].text,
@@ -509,6 +781,7 @@ class JobManager:
             except VideoBurnError as error:
                 preview_error = str(_portable_metadata(str(error)))
             manifest = {
+                "schema_version": 1,
                 "source_file": source_name,
                 "chinese_file": chinese_name,
                 "segment_count": count,
@@ -522,6 +795,16 @@ class JobManager:
             (project / "manifest.json").write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2),
                 encoding="utf-8",
+            )
+            write_provenance(
+                project / "provenance.json",
+                operation="ass",
+                inputs={
+                    "source_srt": project / "source.srt",
+                    "chinese_srt": project / "zh.srt",
+                },
+                outputs={"ass": ass_path},
+                options={"timeline": "source"},
             )
         with self.lock:
             self.ass_assets[identifier] = ass_path
@@ -550,20 +833,28 @@ class JobManager:
             "source": {
                 "name": source_name,
                 "expected_ids": [segment.id for segment in source_segments],
-                "segments": review_payload(source_segments, max_source_chars=MAX_CHARS_BY_TRACK["source"]),
+                "segments": review_payload(
+                    source_segments, max_source_chars=MAX_CHARS_BY_TRACK["source"]
+                ),
             }
         }
         chinese_segments = None
         if chinese_text is not None:
             chinese_segments = parse_srt_text(chinese_text)
             if not chinese_segments:
-                raise ValueError("The Chinese SRT contains no usable subtitle segments.")
+                raise ValueError(
+                    "The Chinese SRT contains no usable subtitle segments."
+                )
             tracks["chinese"] = {
                 "name": chinese_name or "zh.srt",
                 "expected_ids": [segment.id for segment in chinese_segments],
-                "segments": review_payload(chinese_segments, max_source_chars=MAX_CHARS_BY_TRACK["chinese"]),
+                "segments": review_payload(
+                    chinese_segments, max_source_chars=MAX_CHARS_BY_TRACK["chinese"]
+                ),
             }
-        summaries = {key: review_summary(value["segments"]) for key, value in tracks.items()}
+        summaries = {
+            key: review_summary(value["segments"]) for key, value in tracks.items()
+        }
         pairing = self._pairing(source_segments, chinese_segments)
 
         identifier = uuid.uuid4().hex
@@ -574,7 +865,9 @@ class JobManager:
             (project / "review.json").write_text(
                 json.dumps(
                     {
-                        "tracks": {key: value["segments"] for key, value in tracks.items()},
+                        "tracks": {
+                            key: value["segments"] for key, value in tracks.items()
+                        },
                         "summaries": summaries,
                         "pairing": pairing,
                     },
@@ -600,7 +893,11 @@ class JobManager:
         return {
             "id": identifier,
             "tracks": {
-                key: {"name": value["name"], "segments": value["segments"], "summary": summaries[key]}
+                key: {
+                    "name": value["name"],
+                    "segments": value["segments"],
+                    "summary": summaries[key],
+                }
                 for key, value in tracks.items()
             },
             "pairing": pairing,
@@ -617,7 +914,9 @@ class JobManager:
         with self.lock:
             session = self.review_sessions.get(identifier)
         if session is None:
-            raise ValueError("The review session is no longer available. Load the SRT again.")
+            raise ValueError(
+                "The review session is no longer available. Load the SRT again."
+            )
         if not isinstance(raw_tracks, dict):
             raise ValueError("Review save request must contain subtitle tracks.")
         project = Path(session["project"])
@@ -644,7 +943,9 @@ class JobManager:
             persisted_tracks: dict[str, list[dict]] = {}
             for track, track_session, segments, payload in prepared:
                 summary = review_summary(payload)
-                filename = "reviewed.zh.srt" if track == "chinese" else "reviewed.source.srt"
+                filename = (
+                    "reviewed.zh.srt" if track == "chinese" else "reviewed.source.srt"
+                )
                 output_path = output_dir / filename
                 srt_text = build_srt_text(segments)
                 _write_text_atomic(output_path, srt_text)
@@ -668,14 +969,20 @@ class JobManager:
                 persisted_tracks[track] = payload
                 with self.lock:
                     track_session["output_path"] = output_path
-            segments_by_track = {track: segments for track, _session, segments, _payload in prepared}
-            pairing = self._pairing(segments_by_track["source"], segments_by_track.get("chinese"))
+            segments_by_track = {
+                track: segments for track, _session, segments, _payload in prepared
+            }
+            pairing = self._pairing(
+                segments_by_track["source"], segments_by_track.get("chinese")
+            )
             _write_text_atomic(
                 project / "review.json",
                 json.dumps(
                     {
                         "tracks": persisted_tracks,
-                        "summaries": {key: value["summary"] for key, value in results.items()},
+                        "summaries": {
+                            key: value["summary"] for key, value in results.items()
+                        },
                         "pairing": pairing,
                     },
                     ensure_ascii=False,
@@ -717,11 +1024,15 @@ class JobManager:
                 preview.parent.mkdir(parents=True, exist_ok=True)
                 partial = preview.with_name(f".style-preview.{uuid.uuid4().hex}.png")
                 try:
-                    render_bilingual_preview(partial)
+                    self._render_preview(partial)
                     partial.replace(preview)
                 finally:
                     partial.unlink(missing_ok=True)
         return preview
+
+    def _render_preview(self, path: Path, **options) -> None:
+        with resource_context(self.settings.load()):
+            render_bilingual_preview(path, **options)
 
     def ass_preview_path(self, identifier: str) -> Path | None:
         ass = self.ass_path(identifier)
@@ -730,12 +1041,18 @@ class JobManager:
         preview = ass.with_name("bilingual.preview.png")
         return preview if preview.is_file() else None
 
-    def prepare_burn_upload(self, filename: str, ass_identifier: str, profile: str) -> tuple[dict, Path]:
+    def prepare_burn_upload(
+        self, filename: str, ass_identifier: str, profile: str
+    ) -> tuple[dict, Path]:
         ass_path = self.ass_path(ass_identifier)
         if ass_path is None:
-            raise ValueError("The selected ASS subtitle is no longer available. Upload or generate it again.")
+            raise ValueError(
+                "The selected ASS subtitle is no longer available. Upload or generate it again."
+            )
         if profile not in ENCODING_PROFILES:
-            raise ValueError("Encoding profile must be one of: " + ", ".join(ENCODING_PROFILES))
+            raise ValueError(
+                "Encoding profile must be one of: " + ", ".join(ENCODING_PROFILES)
+            )
         identifier = uuid.uuid4().hex
         cleaned = safe_filename(filename)
         # Also keeps the upload from colliding with the project's fixed
@@ -754,10 +1071,19 @@ class JobManager:
             project,
             profile=profile,
             ass_id=ass_identifier,
+            media_path=str(video),
+            source_name=cleaned,
         )
         return job, video
 
-    def start_burn(self, identifier: str, video: Path, profile: str) -> None:
+    def start_burn(
+        self,
+        identifier: str,
+        video: Path,
+        profile: str,
+        *,
+        expected_attempt: str | None = None,
+    ) -> None:
         def work(report, project: Path) -> dict:
             output_dir = project / "output"
             output_dir.mkdir(exist_ok=True)
@@ -784,11 +1110,22 @@ class JobManager:
             work,
             queued_message="Queued for video encoding",
             failure_message="Video encoding failed",
+            expected_attempt=expected_attempt,
         )
 
     def environment(self) -> dict:
-        configured_model = self.model_path or os.environ.get("SUBFLOW_MLX_MODEL")
-        model = Path(configured_model).expanduser() if configured_model else DEFAULT_FRAMELEDGER_MODEL
+        error = None
+        try:
+            values = self.settings.load()
+        except ValueError as problem:
+            values, error = {}, str(problem)
+        with resource_context(values):
+            result = self._environment()
+        result["configuration_error"] = error
+        return result
+
+    def _environment(self) -> dict:
+        model, helper = resolve_mlx_paths(self.model_path, self.helper_path)
         whisperx_python = find_whisperx_python(self.whisperx_python)
         version = whisperx_version(whisperx_python)
         try:
@@ -797,11 +1134,18 @@ class JobManager:
         except VideoBurnError as error:
             ffmpeg_status = {"ready": False, "error": str(error)}
         fonts = {
-            "ready": all((DEFAULT_FONTS_DIR / name).is_file() for name in (SOURCE_HAN_FONT, MULISH_FONT)),
+            "ready": all(
+                (DEFAULT_FONTS_DIR / name).is_file()
+                for name in (SOURCE_HAN_FONT, MULISH_FONT)
+            ),
             "path": str(DEFAULT_FONTS_DIR),
         }
         return {
             "model": {"ready": model.is_dir(), "path": str(model)},
+            "helper": {
+                "ready": helper.is_file() and os.access(helper, os.X_OK),
+                "path": str(helper),
+            },
             "large_model": {
                 "ready": resolve_large_model_path().is_dir(),
                 "path": str(resolve_large_model_path()),
@@ -876,20 +1220,30 @@ class CueFlowHandler(BaseHTTPRequestHandler):
         if length <= 0:
             raise ValueError("The request body is empty.")
         if length > limit:
-            readable = f"{limit / 1024**3:.1f} GB" if limit >= 1024**3 else f"{limit / 1024**2:.0f} MB"
-            raise ValueError(f"Request body exceeds the configured limit of {readable}.")
+            readable = (
+                f"{limit / 1024**3:.1f} GB"
+                if limit >= 1024**3
+                else f"{limit / 1024**2:.0f} MB"
+            )
+            raise ValueError(
+                f"Request body exceeds the configured limit of {readable}."
+            )
         return length
 
     def _receive_file(self, destination: Path) -> None:
         remaining = self._content_length()
         destination.parent.mkdir(parents=True, exist_ok=True)
-        partial = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.upload")
+        partial = destination.with_name(
+            f".{destination.name}.{uuid.uuid4().hex}.upload"
+        )
         try:
             with partial.open("wb") as handle:
                 while remaining:
                     chunk = self.rfile.read(min(1024 * 1024, remaining))
                     if not chunk:
-                        raise ValueError("Upload ended before the declared Content-Length.")
+                        raise ValueError(
+                            "Upload ended before the declared Content-Length."
+                        )
                     handle.write(chunk)
                     remaining -= len(chunk)
             partial.replace(destination)
@@ -907,16 +1261,23 @@ class CueFlowHandler(BaseHTTPRequestHandler):
             raise ValueError("JSON request must be an object.")
         return payload
 
-    def _send_file(self, path: Path, download_name: str, *, attachment: bool = True) -> None:
+    def _send_file(
+        self, path: Path, download_name: str, *, attachment: bool = True
+    ) -> None:
         if not path.is_file():
             self._error(HTTPStatus.NOT_FOUND, "Output file is no longer available.")
             return
-        content_type = mimetypes.guess_type(download_name)[0] or "application/octet-stream"
+        content_type = (
+            mimetypes.guess_type(download_name)[0] or "application/octet-stream"
+        )
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(path.stat().st_size))
         if attachment:
-            self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(download_name)}")
+            self.send_header(
+                "Content-Disposition",
+                f"attachment; filename*=UTF-8''{quote(download_name)}",
+            )
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         with path.open("rb") as handle:
@@ -927,6 +1288,9 @@ class CueFlowHandler(BaseHTTPRequestHandler):
     # manager.operation() so cleanup cannot delete their files mid-write.
     GET_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = (
         ("_get_index", re.compile(r"/")),
+        ("_get_static", re.compile(r"/static/(?P<asset>app\.js|styles\.css)")),
+        ("_get_jobs", re.compile(r"/api/jobs")),
+        ("_get_config", re.compile(r"/api/config")),
         ("_get_environment", re.compile(r"/api/environment")),
         ("_get_style_preview", re.compile(r"/api/ass-preview")),
         ("_get_job", re.compile(r"/api/(?P<route>jobs|translate|burn)/(?P<id>[^/]+)")),
@@ -940,10 +1304,17 @@ class CueFlowHandler(BaseHTTPRequestHandler):
     )
     POST_ROUTES: tuple[tuple[str, re.Pattern[str], bool], ...] = (
         ("_post_cleanup", re.compile(r"/api/cleanup"), False),
+        ("_post_config", re.compile(r"/api/config"), False),
+        ("_post_resume", re.compile(r"/api/jobs/(?P<id>[^/]+)/resume"), True),
+        ("_post_cancel", re.compile(r"/api/jobs/(?P<id>[^/]+)/cancel"), False),
         ("_post_review_audit", re.compile(r"/api/review/audit"), False),
         ("_post_transcription", re.compile(r"/api/jobs"), True),
         ("_post_translation", re.compile(r"/api/translate"), True),
-        ("_post_translation_retry", re.compile(r"/api/translate/(?P<id>[^/]+)/retry"), True),
+        (
+            "_post_translation_retry",
+            re.compile(r"/api/translate/(?P<id>[^/]+)/retry"),
+            True,
+        ),
         ("_post_ass", re.compile(r"/api/ass"), True),
         ("_post_review", re.compile(r"/api/review"), True),
         ("_post_review_save", re.compile(r"/api/review/(?P<id>[^/]+)/save"), True),
@@ -963,7 +1334,9 @@ class CueFlowHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if not request_host_is_loopback(self.headers.get("Host", "")):
-            self._error(HTTPStatus.FORBIDDEN, "CueFlow accepts loopback Host headers only.")
+            self._error(
+                HTTPStatus.FORBIDDEN, "CueFlow accepts loopback Host headers only."
+            )
             return
         parsed = urlparse(self.path)
         route, params = self._match(self.GET_ROUTES, parsed.path)
@@ -977,15 +1350,24 @@ class CueFlowHandler(BaseHTTPRequestHandler):
         except ValueError as error:
             self._error(HTTPStatus.BAD_REQUEST, str(error))
         except Exception as error:
-            self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Unexpected local server error: {error}")
+            self._error(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                f"Unexpected local server error: {error}",
+            )
 
     def do_POST(self) -> None:
         if not request_host_is_loopback(self.headers.get("Host", "")):
-            self._error(HTTPStatus.FORBIDDEN, "CueFlow accepts loopback Host headers only.")
+            self._error(
+                HTTPStatus.FORBIDDEN, "CueFlow accepts loopback Host headers only."
+            )
             return
         supplied_token = self.headers.get("X-CueFlow-CSRF", "")
-        if not supplied_token or not secrets.compare_digest(supplied_token, self.csrf_token):
-            self._error(HTTPStatus.FORBIDDEN, "Missing or invalid CueFlow request token.")
+        if not supplied_token or not secrets.compare_digest(
+            supplied_token, self.csrf_token
+        ):
+            self._error(
+                HTTPStatus.FORBIDDEN, "Missing or invalid CueFlow request token."
+            )
             return
         parsed = urlparse(self.path)
         route, params = self._match(self.POST_ROUTES, parsed.path)
@@ -1002,7 +1384,10 @@ class CueFlowHandler(BaseHTTPRequestHandler):
         except (ValueError, RuntimeError) as error:
             self._error(HTTPStatus.BAD_REQUEST, str(error))
         except Exception as error:
-            self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Unexpected local server error: {error}")
+            self._error(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                f"Unexpected local server error: {error}",
+            )
 
     # -- GET handlers -------------------------------------------------------
 
@@ -1019,6 +1404,26 @@ class CueFlowHandler(BaseHTTPRequestHandler):
         payload = self.manager.environment()
         payload["csrf_token"] = self.csrf_token
         self._send_json(payload)
+
+    def _get_static(self, _query: dict, *, asset: str) -> None:
+        self._send_file(STATIC_FILE.parent / asset, asset, attachment=False)
+
+    def _get_jobs(self, _query: dict) -> None:
+        self._send_json(self.manager.list_jobs())
+
+    def _get_config(self, _query: dict) -> None:
+        self._send_json(self.manager.configuration())
+
+    def _post_config(self, _query: dict) -> None:
+        self._send_json(
+            self.manager.update_configuration(self._read_json().get("resources"))
+        )
+
+    def _post_resume(self, _query: dict, *, id: str) -> None:
+        self._send_json(self.manager.resume_job(id), HTTPStatus.ACCEPTED)
+
+    def _post_cancel(self, _query: dict, *, id: str) -> None:
+        self._send_json(self.manager.cancel_job(id), HTTPStatus.ACCEPTED)
 
     def _get_style_preview(self, _query: dict) -> None:
         try:
@@ -1050,7 +1455,9 @@ class CueFlowHandler(BaseHTTPRequestHandler):
         if path is None:
             self._error(HTTPStatus.NOT_FOUND, "Reviewed SRT output not found.")
         else:
-            self._send_file(path, "reviewed.zh.srt" if track == "chinese" else "reviewed.source.srt")
+            self._send_file(
+                path, "reviewed.zh.srt" if track == "chinese" else "reviewed.source.srt"
+            )
 
     def _get_ass_download(self, _query: dict, *, id: str) -> None:
         path = self.manager.ass_path(id)
@@ -1061,7 +1468,11 @@ class CueFlowHandler(BaseHTTPRequestHandler):
 
     def _get_job_download(self, query: dict, *, route: str, id: str) -> None:
         job = self.manager.snapshot(id)
-        if not job or job.get("kind") != self.JOB_KINDS[route] or job.get("status") != "complete":
+        if (
+            not job
+            or job.get("kind") != self.JOB_KINDS[route]
+            or job.get("status") != "complete"
+        ):
             self._error(HTTPStatus.NOT_FOUND, "Completed output not found.")
             return
         if route == "translate" and query.get("format") == ["ids"]:
@@ -1119,10 +1530,14 @@ class CueFlowHandler(BaseHTTPRequestHandler):
             raise ValueError("Language must be en, fr-CA, or mixed.")
         if alignment not in {"auto", "native", "whisperx"}:
             raise ValueError("Alignment must be auto, native, or whisperx.")
-        job, destination = self.manager.prepare_transcription_upload(filename, language, alignment)
+        job, destination = self.manager.prepare_transcription_upload(
+            filename, language, alignment
+        )
         self._receive_job_upload(job, destination)
         self.manager.start_transcription(job["id"], destination, language, alignment)
-        self._send_job_snapshot(job["id"], "Could not create the local transcription job.")
+        self._send_job_snapshot(
+            job["id"], "Could not create the local transcription job."
+        )
 
     def _post_translation(self, _query: dict) -> None:
         payload = self._read_json()
@@ -1146,8 +1561,16 @@ class CueFlowHandler(BaseHTTPRequestHandler):
 
     def _post_ass(self, _query: dict) -> None:
         payload = self._read_json()
-        required = ("source_filename", "source_srt", "translation_filename", "translation_srt")
-        if any(not isinstance(payload.get(key), str) or not payload[key].strip() for key in required):
+        required = (
+            "source_filename",
+            "source_srt",
+            "translation_filename",
+            "translation_srt",
+        )
+        if any(
+            not isinstance(payload.get(key), str) or not payload[key].strip()
+            for key in required
+        ):
             raise ValueError("Both source-language and Chinese SRT files are required.")
         result = self.manager.create_ass(
             payload["source_filename"],
@@ -1168,7 +1591,9 @@ class CueFlowHandler(BaseHTTPRequestHandler):
         chinese_filename = payload.get("chinese_filename")
         chinese_srt = payload.get("chinese_srt")
         if (chinese_filename is None) != (chinese_srt is None):
-            raise ValueError("Chinese SRT filename and content must be provided together.")
+            raise ValueError(
+                "Chinese SRT filename and content must be provided together."
+            )
         if chinese_srt is not None and (
             not isinstance(chinese_filename, str)
             or not chinese_filename.strip()
@@ -1177,7 +1602,9 @@ class CueFlowHandler(BaseHTTPRequestHandler):
         ):
             raise ValueError("The optional Chinese SRT is invalid.")
         self._send_json(
-            self.manager.create_review(source_filename, source_srt, chinese_filename, chinese_srt),
+            self.manager.create_review(
+                source_filename, source_srt, chinese_filename, chinese_srt
+            ),
             HTTPStatus.CREATED,
         )
 
@@ -1198,13 +1625,18 @@ class CueFlowHandler(BaseHTTPRequestHandler):
         except Exception:
             self.manager.discard_project(destination.parent)
             raise
-        self._send_json(self.manager.register_ass_upload(identifier, destination), HTTPStatus.CREATED)
+        self._send_json(
+            self.manager.register_ass_upload(identifier, destination),
+            HTTPStatus.CREATED,
+        )
 
     def _post_burn(self, query: dict) -> None:
         filename = query.get("filename", [""])[0]
         ass_identifier = query.get("ass_id", [""])[0]
         profile = query.get("profile", ["hevc-source"])[0]
-        job, destination = self.manager.prepare_burn_upload(filename, ass_identifier, profile)
+        job, destination = self.manager.prepare_burn_upload(
+            filename, ass_identifier, profile
+        )
         self._receive_job_upload(job, destination)
         self.manager.start_burn(job["id"], destination, profile)
         self._send_job_snapshot(job["id"], "Could not create the local video job.")
@@ -1221,6 +1653,7 @@ def serve(
     whisperx_python: str | Path | None = None,
     open_browser: bool = True,
     max_upload_gb: float = 20.0,
+    config_path: str | Path | None = None,
 ) -> None:
     host = validate_bind_host(host)
     manager = JobManager(
@@ -1229,6 +1662,7 @@ def serve(
         model_path=model_path,
         helper_path=helper_path,
         whisperx_python=whisperx_python,
+        config_path=config_path,
     )
     server = ThreadingHTTPServer((host, port), CueFlowHandler)
     server.manager = manager  # type: ignore[attr-defined]
@@ -1244,7 +1678,7 @@ def serve(
     except KeyboardInterrupt:
         print("\nStopping CueFlow web UI.")
     finally:
-        manager.executor.shutdown(wait=False, cancel_futures=True)
+        manager.close()
         # Kill running FFmpeg/ASR children so the worker thread can finish
         # instead of keeping the interpreter alive until the job completes.
         proc.terminate_all()

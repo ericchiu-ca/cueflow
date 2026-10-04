@@ -18,10 +18,10 @@ CueFlow 属于**中型单机应用**：代码位于一个 Python package 中，�
 
 | 层 | 当前实现 | 版本或约束来源 |
 | --- | --- | --- |
-| 语言与运行时 | Python | `pyproject.toml` 声明 `>=3.11`；CI 为 3.11/3.13；没有上限 |
+| 语言与运行时 | Python | `pyproject.toml` 声明 `>=3.11`；CI 为 3.11/3.12/3.13；没有上限 |
 | 构建 | setuptools + wheel | `[build-system]`：`setuptools>=77`、`wheel` |
 | CLI | `argparse`，console script `cueflow` | Python 标准库、`pyproject.toml` |
-| Web 服务 | `http.server.ThreadingHTTPServer` + 单文件 HTML/CSS/JS | Python 标准库、`subflow/static/index.html` |
+| Web 服务 | `http.server.ThreadingHTTPServer` + 分离的 HTML/CSS/JS | Python 标准库、`subflow/static/index.html` |
 | YouTube | `yt-dlp` 外部命令 | manifest 与 `requirements.txt` 均为 `>=2024.1` |
 | ASR fallback | `faster-whisper` | 可选依赖 `>=1.2.0` |
 | 主本地 ASR | FrameLedger MLX Whisper model/helper | 仓库外资源；精确 MLX package 版本无法从本仓库确认 |
@@ -29,8 +29,8 @@ CueFlow 属于**中型单机应用**：代码位于一个 Python package 中，�
 | 对齐 | WhisperX | 独立清单固定 `3.8.6` |
 | 翻译 | Codex CLI non-interactive execution | 外部 CLI；仓库不固定 CLI 版本；模型白名单在 `translation.py` |
 | 媒体 | FFmpeg、FFprobe、libass、VideoToolbox | 系统外部依赖；仓库不固定版本 |
-| 测试 | `unittest` | `tests/`；没有 pytest/tox/nox 配置 |
-| CI | GitHub Actions、`macos-14` | `.github/workflows/tests.yml` |
+| 测试 | `unittest` + Playwright | `tests/`、`scripts/`；没有 pytest/tox/nox 配置 |
+| CI | GitHub Actions、`macos-14` + Ubuntu | `.github/workflows/tests.yml` |
 | 字体 | CueFlow Han Sans SC、Mulish、Inter | `subflow/fonts/` 中的 OFL 文本和修改说明（作为 package data 随包安装） |
 
 仓库没有依赖 lockfile。`requirements.txt`、`requirements-whisperx.txt` 和 `pyproject.toml` 是约束清单，不是完整环境快照。
@@ -98,7 +98,7 @@ ASR 检查点的键包含音频内容、语言、initial prompt、MLX worker 源
 
 ### Web 任务与文件生命周期
 
-`JobManager` 只有一个后台 worker，任务状态保存在当前进程内。项目目录名由时间、清理后的源文件名和 job ID 组成。`projects/local/` 下只有以下类别受清理功能管理：
+`JobManager` 只有一个后台 worker；`JobStore` 在每个转录、翻译和压制项目中原子写入版本化 `job.state.json`。恢复时校验相对路径与受管目录，未完成状态转为 `interrupted`，不会自动执行。恢复请求在锁内抢占一次执行机会，旧尝试不能覆盖新尝试；取消 token 关联到该任务的进程组，完成与取消同样由锁串行化。输入和已完成检查点保留。审校会话仍在内存中。项目目录名由时间、清理后的源文件名和 job ID 组成。`projects/local/` 下只有以下类别受清理功能管理：
 
 - `transcriptions/`
 - `translations/`
@@ -113,9 +113,9 @@ ASR 检查点的键包含音频内容、语言、initial prompt、MLX worker 源
 
 | 边界 | 输入/输出 | 当前控制 | 剩余风险 |
 | --- | --- | --- | --- |
-| 本地浏览器 → Web 服务 | 媒体、SRT、ASS、审校 JSON | loopback bind、Host 校验、进程级 CSRF、文件名清理、上传大小限制 | 无远程认证；不得公开暴露；任务状态不持久化 |
-| Web/CLI → FFmpeg/FFprobe | 本地媒体路径、filter 与编码参数 | argv array、超时/进度、临时目录、输出失败时清理 | 外部二进制版本未固定；真实 codec/filter 行为不在 CI |
-| 主进程 → MLX/WhisperX worker | WAV、模型/helper 路径、JSON | 独立进程、返回值校验、fallback/显式失败模式；持久化前保留模型 basename 并清理绝对路径 | 模型内容 hash 和 Python 环境版本未完整记录；源文件名和字幕内容仍可能敏感 |
+| 本地浏览器 → Web 服务 | 媒体、SRT、ASS、审校 JSON | loopback bind、Host 校验、进程级 CSRF、文件名清理、上传大小限制 | 无远程认证；不得公开暴露；任务文件与错误可能敏感 |
+| Web/CLI → FFmpeg/FFprobe | 本地媒体路径、filter 与编码参数 | argv array、超时/进度、临时目录、输出失败时清理 | 外部二进制版本未固定；CI 用合成视频验证 libass 软件渲染；原生硬件编码仍需本机验证 |
+| 主进程 → MLX/WhisperX worker | WAV、模型/helper 路径、JSON | 独立进程、返回值校验、fallback/显式失败模式；持久化前保留模型 basename 并清理绝对路径 | 模型/worker 摘要与主 Python 版本已记录，外部完整 ML 依赖未冻结；源文件名和字幕内容仍可能敏感 |
 | CueFlow → yt-dlp/YouTube | URL、字幕或音频下载 | argv array、可运行性检查、超时 | 网络、站点变化、权限和内容使用权由操作者负责 |
 | CueFlow → Codex/OpenAI | 字幕段、时间、语言、模型 | 用户主动触发；空目录；read-only sandbox；结构化输出；ID 完整性校验 | 账户用量、模型可用性、数据政策和模型输出质量不由仓库保证 |
 | 仓库 → 字体使用者 | 3 个字体二进制、OFL 与修改说明 | 许可证和 notice 随包分发 | 发布者仍需确认上游来源和最终分发权利链 |
@@ -131,8 +131,8 @@ ASR 检查点的键包含音频内容、语言、initial prompt、MLX worker 源
 
 ### 测试与 CI
 
-- CI 使用 `macos-14`、Python 3.11/3.13，只执行 `pip install -e .`，因此不安装 `.[asr]` 或 `requirements-whisperx.txt`。
-- CI 执行 unittest 和 wheel build；测试大量使用 mock/临时文件。
+- CI 单元测试使用 `macos-14`、Python 3.11/3.12/3.13，只执行 `pip install -e .`，因此不安装 `.[asr]` 或 `requirements-whisperx.txt`。
+- CI 执行 unittest、独立 wheel install；另一个 Ubuntu job 安装 FFmpeg 和锁定的 Node 测试依赖，执行真实 libass 软件渲染与 Chromium 交互。所有媒体/字幕都是合成 fixture；仅上传合成测试报告和截图。
 - Web 安全测试会绑定本机临时回环端口；受限沙箱可能阻止该测试。
 - CI 不下载真实模型、YouTube 内容，不登录 Codex，也不执行真实 VideoToolbox 成片验收。
 
@@ -140,15 +140,20 @@ ASR 检查点的键包含音频内容、语言、initial prompt、MLX worker 源
 
 仓库没有服务器部署、容器、数据库、迁移、签名或自动发布文件。这里的生产含义只能是：在操作者自己的 Apple Silicon Mac 上安装并运行本地 CLI/Web 应用。任何公网服务化、团队多用户化或云端部署都超出当前架构和安全支持范围。
 
+## 配置、静态资源与产物格式
+
+`settings.py` 为 CLI 和 Web 提供参数、环境变量、已保存配置、自动发现的统一优先级。Web worker 在排队时冻结本地配置快照；活动任务期间禁止保存新设置。配置损坏必须显式修复。HTML、JS 和 CSS 分离，HTTP 静态路由仅允许三份已知资源，wheel 将它们全部打包。
+
+`master.json`、ASS manifest、job state、config 和 provenance 的新格式均标记 `schema_version: 1`。master 读取兼容未带版本的旧文件；job/config 未知版本拒绝或显示警告。`provenance.py` 记录输入/输出内容 SHA-256、模型内容/worker 指纹、时间与工具版本，不保存绝对路径；远端模型 revision 与不可取得版本为 `null`。这不是完整依赖锁或语义验收。旧产物不自动补写 provenance。
+
 ## 已知技术债务
 
-1. `master.json` 与内部 worker protocol 没有正式 schema version 或迁移策略。
-2. 依赖最低版本已统一，但仓库没有 lockfile，不能精确复现完整 Python 环境。
-3. `pyproject.toml` 允许所有 Python `>=3.11`，但 CI 只验证 3.11/3.13；Python 3.14 未声明支持边界。
-4. Web job/session 只存内存；重启后已生成文件存在，但 job 不能恢复。
-5. 输出目录和 `master.json` 缺少源媒体 hash、模型内容 hash、工具版本快照与生成时间的一致 provenance。
-6. `requirements-whisperx.txt` 固定 WhisperX，但主 MLX helper/Pyannote/FFmpeg/Codex CLI 没有可复现版本记录。
-7. 没有自动发布、tag 校验、clean-install smoke test、SBOM 或制品签名流程。
-8. 公开 Git 历史从单一审查快照开始，没有更早 tag 或 commit 可供版本间比较；新 clone 无法复现快照之前的代码演进。
+1. 内部 worker protocol 已有 v1 标记，但仍需跨版本迁移策略与更多 contract tests。
+2. Node 测试依赖有 lockfile；主 Python/MLX/Pyannote/FFmpeg/Codex 环境仍未完整冻结。
+3. Python 3.14 未在 CI 验证；声明的 Python `>=3.11` 不能代表所有未来版本都已支持。
+4. 审校会话与未保存浏览器编辑仍不能跨服务重启恢复；旧版无 job record 项目需要人工重新导入。
+5. 模型语义质量、WhisperX 对齐效果和真实 Codex 分批恢复仍需获授权媒体与账户验证。
+6. 没有自动发布、tag 校验、SBOM 或制品签名流程；clean-install wheel smoke 已存在。
+7. 公开历史不包含清理后的历史快照之前的对象，不能从新 clone 复现其更早演进。
 
 历史安全审计及其适用边界见 [CODE_AUDIT.md](CODE_AUDIT.md)，测试现状见 [TESTING.md](TESTING.md)，版本与复现规则见 [VERSIONING_AND_RELEASES.md](VERSIONING_AND_RELEASES.md)。

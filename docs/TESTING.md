@@ -4,7 +4,7 @@
 
 ## 实际存在的测试
 
-测试框架是 Python 标准库 `unittest`。仓库没有 pytest、tox、nox、coverage threshold、snapshot test 或端到端浏览器测试配置。
+测试框架是 Python 标准库 `unittest`。仓库没有 pytest、tox、nox 或 coverage threshold；独立 Playwright smoke 与真实 libass 渲染脚本位于 `scripts/`。
 
 | 文件 | 主要覆盖 |
 | --- | --- |
@@ -19,7 +19,7 @@
 | `tests/test_ffmpeg_selection.py` | FFmpeg 选择与 helper 环境 |
 | `tests/test_cli_release.py` | 翻译子命令、默认 model/provider 与可选项 |
 
-这些测试主要是单元测试和轻量集成测试，使用 mock、临时目录、假外部命令和内存 HTTP server。没有真实 YouTube、模型下载、MLX Metal、WhisperX model、Codex 翻译或真实视频编码测试。
+这些测试主要是单元测试和轻量集成测试，使用 mock、临时目录、假外部命令和内存 HTTP server。基础 unittest 不执行真实模型、YouTube 或 Codex 翻译。独立 smoke 使用真实 FFmpeg/libass 与 Chromium，媒体及翻译 provider 为合成 fixture。
 
 ## 可复制命令
 
@@ -133,9 +133,9 @@ cueflow burn --help
 5. `python -m pip wheel . --no-deps -w dist`。
 6. 把 wheel 安装进独立 venv，在仓库目录之外确认 translation schema 和静态页面随包安装，并运行 `cueflow --help`。
 
-CI workflow 只授予 `contents: read`。它不发布 wheel、不创建 tag/Release、不上传测试报告，也不修改云端环境。
+CI workflow 只授予 `contents: read`。它不发布 wheel、不创建 tag/Release、上传合成验证报告/截图，不上传真实用户项目，也不修改部署环境。
 
-CI 安装的是基础 package，不是 `.[asr]`，也不安装 `requirements-whisperx.txt`。因此 CI 主要验证纯 Python 逻辑、mock 边界和 package build，不能证明外部 ML/媒体链路可用。
+CI 安装的是基础 package，不是 `.[asr]`，也不安装 `requirements-whisperx.txt`。另一个 `render-browser` job 在 Ubuntu 安装 FFmpeg、Node.js 22 和锁定的 Playwright/Prettier，运行 UI 格式/语法检查、16:9/4:3 合成视频真实 libass 软件烧录、配置保存、任务恢复/取消、刷新历史、审校保存和未保存保护。它不下载模型、不登录 Codex、不验证 Apple 原生编码或字幕语义质量。
 
 ## 自动测试不能证明什么
 
@@ -181,3 +181,29 @@ CueFlow 不是数据分析或回测项目，没有市场数据、训练集、回
 - **缺失 provenance**：没有源媒体 SHA-256、模型 SHA-256、完整工具版本、lockfile 或标准 run manifest，因而不能从当前仓库做字节级实验复现。
 
 版本化复现与回滚方法见 [VERSIONING_AND_RELEASES.md](VERSIONING_AND_RELEASES.md)。
+
+## 2026-10-03 本地工作流改造
+
+- Python 3.11.15 / 3.12.15：各 **128/128**。新增 17 项覆盖并发重试幂等、过期恢复尝试、取消/完成竞争、排队取消、进程归属、直接子进程退出后的孙进程清理、重启/搬移恢复、损坏/越界记录、原始字幕先落盘、配置优先级/权限/校验/CLI 一致性、provenance 与 legacy master 格式。
+- `ruff check subflow tests scripts`、`npm run check:ui`、`git diff --check` 通过。
+- Playwright 1.62.1 / Chromium：桌面 1440×1000 与手机 390×844；真实 HTTP 配置保存、恢复/取消、下载、刷新、审校编辑/保存/未保存提示、ASS 生成与真实预览均通过，无控制台或 HTTP 错误、无横向溢出。Browser 插件在该会话不可用，因此用 Playwright。翻译 provider 为 fixture，不发 Codex 请求。
+- FFmpeg 9.0.2 + libass：生成 960×540、720×540 黑底合成视频，烧录中英双轨，解码检查实际字幕像素及安全边界；包含空格、引号、方括号、冒号、分号的媒体路径通过。两个原生 `hevc_videotoolbox` 生产烧录也通过，并生成 provenance。
+- macOS 沙箱最初阻止 Chromium Mach port 与原生 VideoToolbox；在获准的宿主执行环境重跑后通过。不是把沙箱失败计为产品通过。
+- 本分支 GitHub CI、Python 3.13、Ubuntu render-browser job 尚未实跑；真实媒体语义、full large-v3/WhisperX/Codex 端到端仍未新增验收。
+
+可复核命令：
+
+```bash
+python3.11 -m unittest discover -s tests -v
+python3.12 -m unittest discover -s tests -v
+ruff check subflow tests scripts
+npm ci --ignore-scripts --no-audit --no-fund
+npx --no-install playwright install chromium
+npm run check:ui
+CUEFLOW_TEST_PYTHON=python3.11 CUEFLOW_QA_OUTPUT=/tmp/cueflow-browser-qa npm run test:browser
+python3.11 -m scripts.render_smoke --output /tmp/cueflow-render-qa
+# 仅支持 Apple 原生编码的 Mac；宿主需允许 VideoToolbox
+python3.11 -m scripts.render_smoke --output /tmp/cueflow-native-qa --native-burn
+```
+
+浏览器 fixture 使用独立临时项目/配置，关闭后删除。截图、测试报告与合成视频默认在仓库外；CI 保存为 `synthetic-render-browser-evidence`，不包含模型或用户媒体。Playwright 浏览器可用 `PLAYWRIGHT_BROWSERS_PATH` 指向另一个目录。Node 只用于开发测试。

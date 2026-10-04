@@ -46,7 +46,7 @@ class TestSubtitleReview(unittest.TestCase):
             audit_review_track([], "other")
 
     def test_web_ui_does_not_reimplement_review_rules(self):
-        html = (Path(__file__).resolve().parents[1] / "subflow" / "static" / "index.html").read_text(
+        html = (Path(__file__).resolve().parents[1] / "subflow" / "static" / "app.js").read_text(
             encoding="utf-8"
         )
         for code in ("EMPTY_TEXT", "INVALID_TIME", "SHORT_DURATION", "LONG_TEXT", "OVERLAP", "REPEATED_TEXT"):

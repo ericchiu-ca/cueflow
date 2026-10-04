@@ -15,7 +15,8 @@ from typing import Callable, Iterable
 
 from .core import SubtitleSegment, parse_srt_file, track_pairing
 from .ffmpeg_tools import find_ffmpeg, has_ass_filter
-from .proc import kill_tree, popen, release
+from .proc import kill_tree, popen, release, run_captured
+from .provenance import command_version, write_provenance
 
 
 SOURCE_HAN_FONT = "CueFlowHanSansSC-SemiBold.otf"
@@ -145,9 +146,13 @@ def _validate_tracks(
     source = list(source_segments)
     chinese = list(chinese_segments)
     if not source:
-        raise SubtitleBuildError("The source-language SRT contains no usable subtitle segments.")
+        raise SubtitleBuildError(
+            "The source-language SRT contains no usable subtitle segments."
+        )
     if not chinese:
-        raise SubtitleBuildError("The Chinese SRT contains no usable subtitle segments.")
+        raise SubtitleBuildError(
+            "The Chinese SRT contains no usable subtitle segments."
+        )
     pairing = track_pairing(source, chinese)
     divergence = pairing["first_divergence"]
     where = (
@@ -158,8 +163,7 @@ def _validate_tracks(
     if len(source) != len(chinese):
         raise SubtitleBuildError(
             "Subtitle count mismatch: "
-            f"source has {len(source)} segments, Chinese has {len(chinese)}."
-            + where
+            f"source has {len(source)} segments, Chinese has {len(chinese)}." + where
         )
     if pairing["drifted_ids"]:
         drifted = pairing["drifted_ids"]
@@ -169,9 +173,15 @@ def _validate_tracks(
             + where
             + " A cue was probably removed in one place and added in another."
         )
-    empty = [str(index) for index, segment in enumerate(chinese, start=1) if not segment.text.strip()]
+    empty = [
+        str(index)
+        for index, segment in enumerate(chinese, start=1)
+        if not segment.text.strip()
+    ]
     if empty:
-        raise SubtitleBuildError(f"Chinese subtitle has empty segments: {', '.join(empty[:8])}")
+        raise SubtitleBuildError(
+            f"Chinese subtitle has empty segments: {', '.join(empty[:8])}"
+        )
     return source, chinese
 
 
@@ -273,7 +283,10 @@ def _wrap_ass_line_for_columns(value: str, max_columns: int) -> list[str]:
         columns = _ass_token_columns(token)
         character = _ass_token_character(token)
         if current and columns and current_columns + columns > max_columns:
-            if character in closing_punctuation and current_columns + columns <= max_columns + 2:
+            if (
+                character in closing_punctuation
+                and current_columns + columns <= max_columns + 2
+            ):
                 current.append(token)
                 current_columns += columns
                 continue
@@ -284,9 +297,8 @@ def _wrap_ass_line_for_columns(value: str, max_columns: int) -> list[str]:
             for candidate_index, candidate in enumerate(current):
                 running_columns += _ass_token_columns(candidate)
                 candidate_character = _ass_token_character(candidate)
-                if (
-                    running_columns >= minimum_break
-                    and (candidate_character.isspace() or candidate_character in break_after)
+                if running_columns >= minimum_break and (
+                    candidate_character.isspace() or candidate_character in break_after
                 ):
                     break_index = candidate_index + 1
 
@@ -318,9 +330,28 @@ def _wrap_ass_cjk_text(value: str, max_columns: int) -> str:
 
 
 ASS_STYLE_FIELDS = (
-    "Name", "Fontname", "Fontsize", "PrimaryColour", "SecondaryColour", "OutlineColour",
-    "BackColour", "Bold", "Italic", "Underline", "StrikeOut", "ScaleX", "ScaleY", "Spacing",
-    "Angle", "BorderStyle", "Outline", "Shadow", "Alignment", "MarginL", "MarginR", "MarginV",
+    "Name",
+    "Fontname",
+    "Fontsize",
+    "PrimaryColour",
+    "SecondaryColour",
+    "OutlineColour",
+    "BackColour",
+    "Bold",
+    "Italic",
+    "Underline",
+    "StrikeOut",
+    "ScaleX",
+    "ScaleY",
+    "Spacing",
+    "Angle",
+    "BorderStyle",
+    "Outline",
+    "Shadow",
+    "Alignment",
+    "MarginL",
+    "MarginR",
+    "MarginV",
     "Encoding",
 )
 
@@ -330,7 +361,7 @@ def _ass_style(lines: list[str], name: str) -> dict[str, str] | None:
         stripped = line.strip()
         if not stripped.startswith("Style:"):
             continue
-        values = [value.strip() for value in stripped[len("Style:"):].split(",")]
+        values = [value.strip() for value in stripped[len("Style:") :].split(",")]
         if len(values) == len(ASS_STYLE_FIELDS) and values[0] == name:
             return dict(zip(ASS_STYLE_FIELDS, values))
     return None
@@ -361,7 +392,9 @@ def adapt_bilingual_ass_for_render(
     libass text block so line stacking is calculated by the renderer itself.
     """
     if frame_width <= 0 or frame_height <= 0:
-        raise VideoBurnError("Video dimensions must be positive before adapting ASS layout.")
+        raise VideoBurnError(
+            "Video dimensions must be positive before adapting ASS layout."
+        )
 
     content_width = active_width if active_width is not None else frame_width
     content_height = active_height if active_height is not None else frame_height
@@ -373,7 +406,9 @@ def adapt_bilingual_ass_for_render(
         or active_x + content_width > frame_width
         or active_y + content_height > frame_height
     ):
-        raise VideoBurnError("Detected active-picture bounds are outside the video frame.")
+        raise VideoBurnError(
+            "Detected active-picture bounds are outside the video frame."
+        )
 
     lines = ass_text.splitlines()
     grouped: dict[tuple[str, str], dict[str, list[tuple[int, list[str]]]]] = {}
@@ -518,6 +553,13 @@ def generate_bilingual_ass(
     output = Path(output_path).expanduser()
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(ass_text, encoding="utf-8")
+    write_provenance(
+        output.with_suffix(".provenance.json"),
+        operation="ass",
+        inputs={"source_srt": source_path, "chinese_srt": chinese_path},
+        outputs={"ass": output},
+        options={"timeline": "source"},
+    )
     return len(source)
 
 
@@ -560,7 +602,7 @@ def _stream_rotation(stream: dict) -> int:
 def _probe_video_info(ffmpeg: Path, video: Path) -> tuple[float | None, _VideoGeometry]:
     ffprobe = _ffprobe_path(ffmpeg)
     try:
-        completed = subprocess.run(
+        completed = run_captured(
             [
                 str(ffprobe),
                 "-v",
@@ -573,9 +615,6 @@ def _probe_video_info(ffmpeg: Path, video: Path) -> tuple[float | None, _VideoGe
                 "json",
                 str(video),
             ],
-            capture_output=True,
-            text=True,
-            check=False,
             timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
@@ -621,7 +660,7 @@ def _detect_active_picture(
     pattern = re.compile(r"crop=(\d+):(\d+):(\d+):(\d+)")
     for sample_time in sample_times:
         try:
-            completed = subprocess.run(
+            completed = run_captured(
                 [
                     str(ffmpeg),
                     "-hide_banner",
@@ -639,9 +678,6 @@ def _detect_active_picture(
                     "null",
                     "-",
                 ],
-                capture_output=True,
-                text=True,
-                check=False,
                 timeout=45,
             )
         except (OSError, subprocess.TimeoutExpired):
@@ -694,7 +730,11 @@ def _geometry_for_encoding_profile(
 
 
 def _ensure_fonts(fonts_dir: Path) -> None:
-    missing = [name for name in (SOURCE_HAN_FONT, MULISH_FONT) if not (fonts_dir / name).is_file()]
+    missing = [
+        name
+        for name in (SOURCE_HAN_FONT, MULISH_FONT)
+        if not (fonts_dir / name).is_file()
+    ]
     if missing:
         raise VideoBurnError(
             f"Bundled subtitle fonts are missing from {fonts_dir}: {', '.join(missing)}"
@@ -729,7 +769,7 @@ def render_bilingual_preview(
             f"scale={ASS_PREVIEW_WIDTH}:{ASS_PREVIEW_HEIGHT}"
         )
         try:
-            completed = subprocess.run(
+            completed = run_captured(
                 [
                     str(ffmpeg),
                     "-hide_banner",
@@ -747,18 +787,19 @@ def render_bilingual_preview(
                     str(output),
                 ],
                 cwd=temp,
-                capture_output=True,
-                text=True,
-                check=False,
                 timeout=60,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             output.unlink(missing_ok=True)
-            raise VideoBurnError(f"FFmpeg could not render the ASS preview: {error}") from error
+            raise VideoBurnError(
+                f"FFmpeg could not render the ASS preview: {error}"
+            ) from error
     if completed.returncode != 0:
         output.unlink(missing_ok=True)
         detail = (completed.stderr or completed.stdout).strip()
-        raise VideoBurnError(f"FFmpeg could not render the ASS preview: {detail[-2000:]}")
+        raise VideoBurnError(
+            f"FFmpeg could not render the ASS preview: {detail[-2000:]}"
+        )
     return output
 
 
@@ -804,7 +845,11 @@ def burn_ass_into_video(
     if not ass.is_file():
         raise VideoBurnError(f"ASS subtitle file was not found: {ass}")
     canonical_profile, video_options = video_encoding_options(profile)
-    video_filter = VIDEO_FILTER_SOURCE if canonical_profile == "hevc-source" else VIDEO_FILTER_1080P
+    video_filter = (
+        VIDEO_FILTER_SOURCE
+        if canonical_profile == "hevc-source"
+        else VIDEO_FILTER_1080P
+    )
     _ensure_fonts(fonts)
     ffmpeg = find_ass_ffmpeg(ffmpeg_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -812,7 +857,9 @@ def burn_ass_into_video(
     report("layout", 2, "Detecting the video's active picture and subtitle safe area")
     duration, source_geometry = _probe_video_info(ffmpeg, video)
     detected_geometry = _detect_active_picture(ffmpeg, video, duration, source_geometry)
-    render_geometry = _geometry_for_encoding_profile(detected_geometry, canonical_profile)
+    render_geometry = _geometry_for_encoding_profile(
+        detected_geometry, canonical_profile
+    )
     report(
         "encoding",
         3,
@@ -830,7 +877,9 @@ def burn_ass_into_video(
             try:
                 ass_text = ass.read_text(encoding="utf-16")
             except UnicodeError as error:
-                raise VideoBurnError("ASS subtitle must be encoded as UTF-8 or UTF-16.") from error
+                raise VideoBurnError(
+                    "ASS subtitle must be encoded as UTF-8 or UTF-16."
+                ) from error
         layout_warnings: list[str] = []
         render_ass = adapt_bilingual_ass_for_render(
             ass_text,
@@ -908,7 +957,11 @@ def burn_ass_into_video(
                     percent = min(98, max(3, int(elapsed / duration * 95) + 3))
                     if percent >= last_percent + 2:
                         last_percent = percent
-                        report("encoding", percent, f"Burning subtitles into video ({percent}%)")
+                        report(
+                            "encoding",
+                            percent,
+                            f"Burning subtitles into video ({percent}%)",
+                        )
             return_code = process.wait()
         except BaseException:
             # A failing progress callback or interrupt must not leave FFmpeg
@@ -934,5 +987,13 @@ def burn_ass_into_video(
             if canonical_profile == "hevc-source"
             else f"Bilingual subtitles burned into 1080p {canonical_profile.upper()} video"
         ),
+    )
+    write_provenance(
+        output.with_suffix(".provenance.json"),
+        operation="burn",
+        inputs={"video": video, "ass": ass},
+        outputs={"video": output},
+        tools={"ffmpeg": command_version(ffmpeg)},
+        options={"profile": canonical_profile},
     )
     return output

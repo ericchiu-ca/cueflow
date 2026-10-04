@@ -13,7 +13,7 @@
 
 CueFlow is a Python CLI and local web app for Apple Silicon macOS. It uses WhisperX/Pyannote VAD to create speech windows, transcribes them with local MLX Whisper large-v3-turbo, and selectively retries low-confidence windows with full large-v3. English, Canadian French, and per-window mixed English/French detection are supported before WhisperX word-level alignment. CueFlow also translates stable-ID subtitles through Codex, provides a dual-track review desk, generates styled bilingual ASS, and hard-burns it with HEVC VideoToolbox.
 
-Each speech window receives a `0-100` score, detected language, selected model, and Turbo/large-v3 disagreement record in `master.json`; medium and low confidence windows automatically become review warnings. The full model defaults to `~/Documents/FrameLedger/.cache/models/whisper-large-v3-mlx` and can be overridden with `SUBFLOW_MLX_LARGE_MODEL`.
+Each speech window receives a `0-100` score, detected language, selected model, and Turbo/large-v3 disagreement record in `master.json`; medium and low confidence windows automatically become review warnings. Resource discovery checks `~/Documents/ChatGPT/FrameLedger` before the legacy `~/Documents/FrameLedger`; `SUBFLOW_MLX_LARGE_MODEL` or saved local settings can override the full model path.
 
 > Local-first media: video, audio, ASR, alignment, ASS generation, and encoding stay on the Mac. When Codex translation is explicitly used, the request includes subtitle text, stable IDs, start/end times, source language, and the selected model; video and audio are not uploaded.
 
@@ -173,17 +173,25 @@ python3.11 -m unittest discover -s tests -v
 python3.11 -m pip wheel . --no-deps --no-build-isolation -w dist
 ```
 
-The current public baseline passes all 51 unit tests on Python 3.11 and 3.12 when loopback binding is permitted. The repository owner has confirmed completing real-media ASR, translation, burn, cleanup, and Apple VideoToolbox checks; the exact tool versions, input/output hashes, and acceptance record have not been committed. See [docs/TESTING.md](docs/TESTING.md) for exact evidence, [docs/CODE_AUDIT.md](docs/CODE_AUDIT.md) for the audit boundary, and [SECURITY.md](SECURITY.md) for current data boundaries.
+Local Python 3.11 and 3.12 each pass 128 tests. Synthetic 16:9/4:3 libass rendering, native HEVC burning and Chromium desktop/mobile interactions pass. The new GitHub workflow has not run on this local commit; real model quality and Codex translation require separate acceptance. See [docs/TESTING.md](docs/TESTING.md) for exact evidence, [docs/CODE_AUDIT.md](docs/CODE_AUDIT.md) for the audit boundary, and [SECURITY.md](SECURITY.md) for current data boundaries.
+
+## Local settings and recovery
+
+The Web UI saves model/helper, WhisperX Python and FFmpeg paths in `~/Library/Application Support/CueFlow/config.json` with private file permissions. CLI arguments override environment variables, which override saved settings and automatic discovery. Use `CUEFLOW_CONFIG` or `cueflow --config /path/to/config.json <command>` to select another file. Settings cannot change while tasks are active.
+
+The task history offers manual resume and scoped cancellation; inputs and completed checkpoints are retained. New `master.json` files use schema version 1 and still accept unversioned legacy files. Provenance sidecars record content hashes, model/worker fingerprints and available tool versions; unknown remote model revisions remain `null`.
+
+Development checks: `npm ci --ignore-scripts`, `npx --no-install playwright install chromium`, `npm run check:ui`, `npm run test:browser`, and `python -m scripts.render_smoke --output /tmp/cueflow-render-check`. Node.js 22 is only needed for browser development/CI, not normal use. The browser fixture uses a synthetic translation provider and calls no model service.
 
 ## Current limitations
 
-- Large SRT files are not chunked or resumable and can exceed the model context window.
-- Job state is in memory. Completed files remain after restart, but old jobs cannot be polled.
+- Translation uses batches of 120 subtitles with validated resumable checkpoints; an unusually long individual subtitle can still exceed model limits.
+- Job records persist per project. Restarted unfinished jobs require manual resume; review sessions and unsaved edits remain transient. Old projects without job records are not automatically imported.
 - WhisperX improves timing boundaries but cannot guarantee transcription text accuracy.
 - Vertical video does not yet have a dedicated ASS layout.
 - Output is SDR `yuv420p`; HDR metadata and tone mapping are not preserved.
 - New transcription `master.json` files retain model basenames rather than absolute paths and scrub absolute paths from nested metadata. Source filenames, subtitles, and quality metadata can still be sensitive.
-- The repository has no dependency lockfile; `pyproject.toml` and `requirements.txt` now agree on `yt-dlp>=2024.1`.
+- Python dependencies have no unified lockfile; browser-test dependencies use `package-lock.json`; `pyproject.toml` and `requirements.txt` now agree on `yt-dlp>=2024.1`.
 
 ## Documentation
 

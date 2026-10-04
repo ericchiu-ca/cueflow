@@ -33,5 +33,41 @@ jobs:
           python -m venv "$RUNNER_TEMP/wheel-venv"
           "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install dist/cueflow_subtitles-*.whl
           cd "$RUNNER_TEMP"
-          "$RUNNER_TEMP/wheel-venv/bin/python" -c "from subflow.translation import TRANSLATION_SCHEMA; from subflow.web import STATIC_FILE; assert TRANSLATION_SCHEMA.is_file(), TRANSLATION_SCHEMA; assert STATIC_FILE.is_file(), STATIC_FILE; from subflow.bilingual import DEFAULT_FONTS_DIR, SOURCE_HAN_FONT, MULISH_FONT; assert all((DEFAULT_FONTS_DIR / name).is_file() for name in (SOURCE_HAN_FONT, MULISH_FONT)), DEFAULT_FONTS_DIR"
+          "$RUNNER_TEMP/wheel-venv/bin/python" -c "from subflow.translation import TRANSLATION_SCHEMA; from subflow.web import STATIC_FILE; assert TRANSLATION_SCHEMA.is_file(), TRANSLATION_SCHEMA; assert all((STATIC_FILE.parent / name).is_file() for name in ('index.html', 'app.js', 'styles.css')); from subflow.bilingual import DEFAULT_FONTS_DIR, SOURCE_HAN_FONT, MULISH_FONT; assert all((DEFAULT_FONTS_DIR / name).is_file() for name in (SOURCE_HAN_FONT, MULISH_FONT)), DEFAULT_FONTS_DIR"
           "$RUNNER_TEMP/wheel-venv/bin/cueflow" --help > /dev/null
+
+  render-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CUEFLOW_CONFIG: ${{ runner.temp }}/cueflow-config.json
+      CUEFLOW_QA_OUTPUT: ${{ runner.temp }}/cueflow-qa/browser
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Install render and browser test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install -e .
+          npm ci --ignore-scripts --no-audit --no-fund
+          npx --no-install playwright install --with-deps chromium
+      - name: Check frontend syntax and formatting
+        run: npm run check:ui
+      - name: Render real libass subtitles on generated 16:9 and 4:3 videos
+        run: python -m scripts.render_smoke --output "$RUNNER_TEMP/cueflow-qa/render"
+      - name: Exercise UI settings, restart history, resume, cancel and review
+        run: npm run test:browser
+      - name: Preserve synthetic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-render-browser-evidence
+          path: ${{ runner.temp }}/cueflow-qa
+          if-no-files-found: ignore

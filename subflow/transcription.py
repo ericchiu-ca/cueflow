@@ -19,13 +19,13 @@ from .core import (
     save_master_json,
 )
 from .ffmpeg_tools import find_ffmpeg
+from .settings import resolve_resource
+from .provenance import command_version, write_provenance
 from .proc import run_captured
 
 
 FRAMELEDGER_ROOT = Path.home() / "Documents" / "FrameLedger"
-DEFAULT_MLX_MODEL = (
-    FRAMELEDGER_ROOT / ".cache" / "models" / "whisper-large-v3-turbo"
-)
+DEFAULT_MLX_MODEL = FRAMELEDGER_ROOT / ".cache" / "models" / "whisper-large-v3-turbo"
 DEFAULT_MLX_LARGE_MODEL = (
     FRAMELEDGER_ROOT / ".cache" / "models" / "whisper-large-v3-mlx"
 )
@@ -53,14 +53,10 @@ ProgressCallback = Callable[[str, int, str], None]
 MAX_COMPRESSION_RATIO = 2.4
 QUALITY_RETRY_PADDING_SECONDS = 0.25
 MAX_AUTOMATIC_QUALITY_RETRIES = 12
-QUOTED_FILE_URI_RE = re.compile(
-    r'''(["'])file:/+[^"'\r\n]*\1''', re.IGNORECASE
-)
-FILE_URI_RE = re.compile(
-    r'''(?<![\w/.-])file:/+[^"'\r\n<>]+''', re.IGNORECASE
-)
-QUOTED_ABSOLUTE_PATH_RE = re.compile(r'''(["'])/(?!/)[^"'\r\n]*\1''')
-ABSOLUTE_PATH_RE = re.compile(r'''(?<![\w/.-])/(?!/)[^"'\r\n<>]+''')
+QUOTED_FILE_URI_RE = re.compile(r"""(["'])file:/+[^"'\r\n]*\1""", re.IGNORECASE)
+FILE_URI_RE = re.compile(r"""(?<![\w/.-])file:/+[^"'\r\n<>]+""", re.IGNORECASE)
+QUOTED_ABSOLUTE_PATH_RE = re.compile(r"""(["'])/(?!/)[^"'\r\n]*\1""")
+ABSOLUTE_PATH_RE = re.compile(r"""(?<![\w/.-])/(?!/)[^"'\r\n<>]+""")
 
 
 class TranscriptionError(RuntimeError):
@@ -126,7 +122,7 @@ class MlxTranscription:
 
 
 def resolve_large_model_path(value: str | Path | None = None) -> Path:
-    configured = value or os.environ.get("SUBFLOW_MLX_LARGE_MODEL") or DEFAULT_MLX_LARGE_MODEL
+    configured = resolve_resource("large_model_path", value) or DEFAULT_MLX_LARGE_MODEL
     return Path(configured).expanduser().resolve()
 
 
@@ -134,12 +130,16 @@ def resolve_mlx_paths(
     model_path: str | Path | None = None,
     helper_path: str | Path | None = None,
 ) -> tuple[Path, Path]:
-    model = Path(
-        model_path or os.environ.get("SUBFLOW_MLX_MODEL") or DEFAULT_MLX_MODEL
-    ).expanduser().resolve()
-    helper = Path(
-        helper_path or os.environ.get("SUBFLOW_MLX_HELPER") or DEFAULT_MLX_HELPER
-    ).expanduser().resolve()
+    model = (
+        Path(resolve_resource("model_path", model_path) or DEFAULT_MLX_MODEL)
+        .expanduser()
+        .resolve()
+    )
+    helper = (
+        Path(resolve_resource("helper_path", helper_path) or DEFAULT_MLX_HELPER)
+        .expanduser()
+        .resolve()
+    )
     return model, helper
 
 
@@ -148,7 +148,9 @@ def resolve_language(value: str) -> str:
         return LANGUAGE_CODES[value]
     except KeyError as error:
         choices = ", ".join(LANGUAGE_CODES)
-        raise TranscriptionError(f"Unsupported language: {value}. Choose: {choices}") from error
+        raise TranscriptionError(
+            f"Unsupported language: {value}. Choose: {choices}"
+        ) from error
 
 
 def validate_media_path(path: Path) -> Path:
@@ -156,9 +158,7 @@ def validate_media_path(path: Path) -> Path:
     if not source.is_file():
         raise TranscriptionError(f"Media file not found: {source}")
     if source.suffix.lower() not in SUPPORTED_EXTENSIONS:
-        raise TranscriptionError(
-            f"Unsupported media type: {source.suffix or '(none)'}"
-        )
+        raise TranscriptionError(f"Unsupported media type: {source.suffix or '(none)'}")
     return source
 
 
@@ -191,7 +191,9 @@ def _ffmpeg_subprocess_env() -> dict[str, str]:
     ffmpeg = Path(_ensure_ffmpeg())
     environment = os.environ.copy()
     current_path = environment.get("PATH", "")
-    environment["PATH"] = str(ffmpeg.parent) + (os.pathsep + current_path if current_path else "")
+    environment["PATH"] = str(ffmpeg.parent) + (
+        os.pathsep + current_path if current_path else ""
+    )
     environment["FFMPEG_BINARY"] = str(ffmpeg)
     environment["IMAGEIO_FFMPEG_EXE"] = str(ffmpeg)
     return environment
@@ -205,7 +207,9 @@ def _run_ffmpeg_checked(command: list[str], *, timeout: float, what: str) -> Non
     try:
         completed = run_captured(command, timeout=timeout)
     except subprocess.TimeoutExpired as error:
-        raise TranscriptionError(f"ffmpeg timed out after {timeout:.0f}s while trying to {what}") from error
+        raise TranscriptionError(
+            f"ffmpeg timed out after {timeout:.0f}s while trying to {what}"
+        ) from error
     except OSError as error:
         raise TranscriptionError(f"ffmpeg could not start: {error}") from error
     if completed.returncode != 0:
@@ -351,7 +355,8 @@ def _quality_issues_from_result(result: Mapping[str, object]) -> list[dict]:
         end_value = item.get("end")
         start = (
             round(float(start_value), 3)
-            if isinstance(start_value, (int, float)) and not isinstance(start_value, bool)
+            if isinstance(start_value, (int, float))
+            and not isinstance(start_value, bool)
             else None
         )
         end = (
@@ -516,7 +521,11 @@ def transcribe_with_mlx(
         )
     large_model = resolve_large_model_path()
     configured_whisperx = find_whisperx_python(whisperx_python)
-    if decoding_profile == "standard_fallback_v1" and large_model.is_dir() and configured_whisperx:
+    if (
+        decoding_profile == "standard_fallback_v1"
+        and large_model.is_dir()
+        and configured_whisperx
+    ):
         try:
             from .advanced_asr import transcribe_vad_cascade
 
@@ -545,7 +554,9 @@ def transcribe_with_mlx(
             )
         except Exception as error:
             if language == "mixed":
-                raise TranscriptionError(f"Mixed-language VAD cascade failed: {error}") from error
+                raise TranscriptionError(
+                    f"Mixed-language VAD cascade failed: {error}"
+                ) from error
             cascade_warning = (
                 "VAD/large-v3 cascade failed; used full-file Turbo fallback: "
                 + str(error)[:300]
@@ -581,7 +592,9 @@ def transcribe_with_mlx(
             timeout=timeout_seconds,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise TranscriptionError(f"MLX Whisper helper could not run: {error}") from error
+        raise TranscriptionError(
+            f"MLX Whisper helper could not run: {error}"
+        ) from error
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()[-2000:]
         raise TranscriptionError(
@@ -591,7 +604,10 @@ def transcribe_with_mlx(
         response = json.loads(completed.stdout)
     except json.JSONDecodeError as error:
         raise TranscriptionError("MLX Whisper helper returned invalid JSON") from error
-    if not isinstance(response, dict) or response.get("protocol") != "frameledger-asr-helper-v1":
+    if (
+        not isinstance(response, dict)
+        or response.get("protocol") != "frameledger-asr-helper-v1"
+    ):
         raise TranscriptionError("MLX Whisper helper protocol mismatch")
     result = response.get("result")
     if not isinstance(result, Mapping):
@@ -744,7 +760,11 @@ def _retry_quality_issues(
         clip_start = max(0.0, target_start - QUALITY_RETRY_PADDING_SECONDS)
         clip_end = target_end + QUALITY_RETRY_PADDING_SECONDS
         if progress:
-            percent = 45 + round(22 * (index + 1) / max(1, min(len(groups), MAX_AUTOMATIC_QUALITY_RETRIES)))
+            percent = 45 + round(
+                22
+                * (index + 1)
+                / max(1, min(len(groups), MAX_AUTOMATIC_QUALITY_RETRIES))
+            )
             progress(
                 "quality-retry",
                 percent,
@@ -825,6 +845,9 @@ def _attach_quality_issue_ids(
 
 def find_whisperx_python(value: str | Path | None = None) -> Path | None:
     configured = value or os.environ.get("SUBFLOW_WHISPERX_PYTHON")
+    if not configured:
+        candidate = resolve_resource("whisperx_python")
+        configured = candidate if candidate and candidate.is_file() else None
     if configured:
         path = Path(configured).expanduser().absolute()
         return path if path.is_file() else None
@@ -887,7 +910,9 @@ def _run_whisperx_alignment(
             timeout=timeout_seconds,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise TranscriptionError(f"WhisperX alignment could not run: {error}") from error
+        raise TranscriptionError(
+            f"WhisperX alignment could not run: {error}"
+        ) from error
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()[-3000:]
         raise TranscriptionError(f"WhisperX alignment failed: {detail}")
@@ -923,7 +948,8 @@ def _preserve_aligned_text(
             end=aligned_segment.end,
             text=(
                 original_segment.text
-                if _comparable_text(original_segment.text) == _comparable_text(aligned_segment.text)
+                if _comparable_text(original_segment.text)
+                == _comparable_text(aligned_segment.text)
                 else aligned_segment.text
             ),
             words=aligned_segment.words,
@@ -1072,9 +1098,7 @@ def transcribe_media(
         if alignment_mode != "native":
             python_path = find_whisperx_python(whisperx_python)
             if python_path is None:
-                message = (
-                    "WhisperX 环境未配置，已使用 MLX Whisper 词级时间戳。"
-                )
+                message = "WhisperX 环境未配置，已使用 MLX Whisper 词级时间戳。"
                 if alignment_mode == "whisperx":
                     raise TranscriptionError(
                         message
@@ -1084,7 +1108,9 @@ def transcribe_media(
             else:
                 update("aligning", 76, "正在使用 WhisperX 做词级强制对齐")
                 try:
-                    cache_dir = Path(__file__).resolve().parents[1] / ".cache" / "whisperx"
+                    cache_dir = (
+                        Path(__file__).resolve().parents[1] / ".cache" / "whisperx"
+                    )
                     if whisper_language == "mixed":
                         segments = _run_mixed_whisperx_alignment(
                             wav_path,
@@ -1106,9 +1132,7 @@ def transcribe_media(
                 except TranscriptionError:
                     if alignment_mode == "whisperx":
                         raise
-                    warnings.append(
-                        "WhisperX 对齐失败，已回退到 MLX 词级时间戳"
-                    )
+                    warnings.append("WhisperX 对齐失败，已回退到 MLX 词级时间戳")
 
         mlx_result.confidence_windows = _attach_confidence_window_ids(
             mlx_result.confidence_windows, segments
@@ -1157,6 +1181,24 @@ def transcribe_media(
             metadata=metadata,
         )
         srt_path.write_text(build_srt_text(segments), encoding="utf-8")
+        used_models = {"turbo": model}
+        if mlx_result.large_v3_window_count:
+            used_models["large_v3"] = resolve_large_model_path()
+        ffmpeg, _ = find_ffmpeg()
+        write_provenance(
+            project / "provenance.json",
+            operation="transcription",
+            inputs={"media": source},
+            outputs={"srt": srt_path, "master": master_path},
+            models=used_models,
+            tools={
+                "ffmpeg": command_version(ffmpeg),
+                "whisperx": whisperx_version(find_whisperx_python(whisperx_python))
+                if alignment.startswith("whisperx")
+                else None,
+            },
+            options={"language": language, "alignment": alignment},
+        )
         update("done", 100, "字幕已生成")
         return TranscriptionResult(
             project=project,
@@ -1208,7 +1250,9 @@ def align_existing_project(
     else:
         source = (project / source_name).resolve()
         if source.parent != project:
-            raise TranscriptionError("Source media must remain directly inside the project")
+            raise TranscriptionError(
+                "Source media must remain directly inside the project"
+            )
         if not source.is_file():
             raise TranscriptionError(
                 f"Media file `{source.name}` is not inside the project; pass its location with --source"
@@ -1288,7 +1332,9 @@ def align_existing_project(
             )
         aligned_metadata.update(
             {
-                "alignment": "whisperx-mixed" if whisper_language == "mixed" else "whisperx",
+                "alignment": "whisperx-mixed"
+                if whisper_language == "mixed"
+                else "whisperx",
                 "whisperx_version": version,
                 "derived_from": master_path.name,
                 "warnings": [],
@@ -1300,6 +1346,13 @@ def align_existing_project(
             metadata=_portable_metadata(aligned_metadata),
         )
         aligned_srt.write_text(build_srt_text(aligned), encoding="utf-8")
+        write_provenance(
+            project / "alignment.provenance.json",
+            operation="alignment",
+            inputs={"media": source, "original_master": master_path},
+            outputs={"srt": aligned_srt, "master": aligned_master},
+            tools={"whisperx": version},
+        )
         update("done", 100, "现有字幕已完成 WhisperX 对齐")
         return TranscriptionResult(
             project=project,

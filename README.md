@@ -16,7 +16,7 @@ CueFlow 把视频或音频变成可追溯的字幕项目：本地转录、可选
 - **平台**：主要面向 Apple Silicon macOS。`pyproject.toml` 声明 Python `>=3.11`；CI 覆盖 Python 3.11、3.12 和 3.13，建议本地优先使用 3.11。
 - **运行方式**：本地 CLI 或仅绑定回环地址的本地网页；不是多用户服务，不得通过反向代理或公网隧道暴露。
 - **数据边界**：视频、音频、ASR、WhisperX、ASS 和 FFmpeg 编码留在本机。主动使用 Codex 翻译时，请求包含字幕文本、稳定 ID、起止时间、源语言和所选模型；不会上传视频或音频。
-- **验证状态**：当前公开基线在 Python 3.11 和 3.12 上各有 51/51 项单元测试通过；wheel 可在 Python 3.11 构建。仓库所有者已确认完成真实媒体的 ASR、翻译、烧录、清理和 Apple VideoToolbox 人工验收，但详细证据尚未进入 Git。详见 [测试指南](docs/TESTING.md)。
+- **验证状态**：本地 Python 3.11/3.12 各 128 项测试通过；合成视频的真实 libass/HEVC 烧录与 Chromium 桌面、手机尺寸交互通过。CI 定义包含 Python 3.11/3.12/3.13、真实软件渲染和浏览器 smoke；本地新提交尚未在 GitHub 执行。真实模型字幕质量与 Codex 翻译仍需独立验收。详见 [测试指南](docs/TESTING.md)。
 
 CueFlow 不保证 ASR 或翻译语义完全正确，最终字幕和成片必须人工审校。
 
@@ -55,7 +55,7 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[asr]"
 ```
 
-`.[asr]` 包含 YouTube 无字幕时使用的可选 `faster-whisper` fallback。仓库没有 lockfile，安装会按约束解析当时可用版本，不能视为字节级可复现环境。
+`.[asr]` 包含 YouTube 无字幕时使用的可选 `faster-whisper` fallback。Python 依赖没有统一 lockfile，安装会按约束解析当时可用版本，不能视为字节级可复现环境。浏览器测试依赖单独由 `package-lock.json` 固定。
 
 ### 3. 可选 WhisperX 环境
 
@@ -92,7 +92,11 @@ cueflow web \
 | `SUBFLOW_FFMPEG` | 可运行且具备所需 filter/encoder 的 FFmpeg |
 | `SUBFLOW_CODEX` | Codex CLI 可执行文件 |
 
-默认资源路径由当前用户的 home 目录推导到 `~/Documents/FrameLedger/...`。网页环境状态和实际转录现在统一读取 `SUBFLOW_MLX_MODEL`；显式 `--model-path` 仍具有优先级。
+网页的“环境配置”可选择 Turbo/full large-v3 模型目录、MLX helper、WhisperX Python 和 FFmpeg。留空恢复自动发现；输入路径必须存在，helper/Python/FFmpeg 必须可执行。路径可用不代表模型格式或 WhisperX 依赖完整，最终以环境检查和任务结果为准。
+
+CLI 与网页使用同一规则：**命令参数 > 环境变量 > 已保存配置 > 自动发现**。配置默认保存在 `~/Library/Application Support/CueFlow/config.json`（仅当前用户可读写）；`CUEFLOW_CONFIG` 或 `cueflow --config /path/to/config.json <command>` 可选择其他文件，Web 也接受 `cueflow web --config ...`。正在运行或排队的任务完成前不能保存配置。自动发现优先检查 `~/Documents/ChatGPT/FrameLedger`，再兼容原来的 `~/Documents/FrameLedger`；FFmpeg 使用可运行且包含 libass 的候选；指定的 FFmpeg 不满足要求时，页面明确显示“自动回退”及实际使用路径。
+
+配置文件损坏时，页面显示错误并允许显式重新保存；后台任务在修复前拒绝执行，不会悄悄使用另一份配置。
 
 使用 Codex 翻译前：
 
@@ -102,6 +106,14 @@ codex login status
 ```
 
 Codex CLI 的登录方式、模型可用性和账户用量由 OpenAI 当前产品与账户策略决定；参见官方 [Authentication](https://learn.chatgpt.com/docs/auth) 和 [Models](https://learn.chatgpt.com/docs/models) 文档。
+
+## 任务记录、恢复与取消
+
+网页“任务记录与恢复”显示最近 30 个任务；完整记录仍保存在各项目的 `job.state.json`，API 返回全部。服务重启后，上传中、排队或运行中的任务标记为“已中断”，不会自动调用模型或 Codex。点击“恢复任务”沿用原项目和输入，复用匹配的 ASR/翻译检查点；重复点击或并发重试只排队一次。输入丢失或上传未完成时，应重新上传。旧版本未保存任务记录的项目不会自动变成可恢复任务。
+
+“取消”终止该任务的媒体处理子进程，保留输入和已完成检查点；取消后可再次恢复。已经完成的产物仍可下载。短小的工具版本检查受原有超时限制，取消在这些检查结束后生效。审校会话与未保存编辑仍只在浏览器/当前服务内，应先保存和下载。
+
+新 `master.json` 使用 `schema_version: 1`；旧版没有该字段时仍可读取，未知版本会报错。转录/翻译项目和 ASS/MP4 旁的 `provenance.json` 或 `*.provenance.json` 记录输入/输出 SHA-256、模型内容与 worker 指纹、生成时间、CueFlow/Python 及可取得的工具版本。缺失版本记为 `null`，Codex 远端模型 revision 仍未知；这些记录不证明识别或翻译质量。
 
 ## 最小运行示例
 
@@ -163,7 +175,8 @@ cueflow burn input.mp4 output/bilingual.ass \
 │   ├── web.py                  # 回环 HTTP 服务与任务生命周期
 │   ├── proc.py                 # 子进程生命周期（进程组、超时、退出清理）
 │   ├── ffmpeg_tools.py         # FFmpeg 查找与探测缓存
-│   ├── static/index.html       # 单页本地 UI
+│   ├── settings.py / job_store.py / provenance.py # 配置、任务记录、产物证据
+│   ├── static/                 # index.html、app.js、styles.css
 │   ├── schemas/                # 翻译结果 JSON Schema
 │   └── fonts/                  # 内置字体、许可证和修改说明（随包安装）
 ├── tests/                      # unittest 测试
@@ -183,19 +196,29 @@ python3.11 -m pip wheel . --no-deps --no-build-isolation -w dist
 git diff --check
 ```
 
-当前纯 Python 测试已全绿，真实媒体链路也已由仓库所有者确认完成；发布前仍应按 [docs/TESTING.md](docs/TESTING.md) 补齐可审计的版本、输入 hash、命令和产物记录。
+新增浏览器和渲染验证命令：
+
+```bash
+npm ci --ignore-scripts
+npx --no-install playwright install chromium
+npm run check:ui
+npm run test:browser
+python3.11 -m scripts.render_smoke --output /tmp/cueflow-render-check
+```
+
+Node.js 22 只用于开发/CI 浏览器测试；运行 CueFlow 不需要 Node。发布前仍应按 [docs/TESTING.md](docs/TESTING.md) 补齐可审计的版本、输入 hash、命令和产物记录。
 
 ## 已知限制
 
-- `master.json` 没有显式 schema version，也没有源媒体 hash；跨版本兼容和输入同一性不能自动证明。
+- 产物记录了格式版本与内容 hash，但没有跨版本自动迁移机制，也不冻结外部 MLX/Python 环境或远端模型 revision。
 - 新生成的转录 `master.json` 只保存模型目录 basename，并递归清理元数据字符串中的绝对本机路径；它仍会保存源媒体 basename、字幕和质量信息，分享前仍需检查内容敏感性。
 - `pyproject.toml` 与 `requirements.txt` 已统一 `yt-dlp>=2024.1`，但仓库仍没有统一 lockfile。
-- 网页任务队列只存在于当前进程，重启后不能继续轮询旧任务。
-- 大型 SRT 没有自动分批和断点续译，可能超过模型上下文窗口。
+- 任务记录可恢复；审校会话、未保存编辑和旧版无记录项目仍不能从服务重启中自动恢复。
+- 大型 SRT 按默认 120 条分批，可复用匹配检查点；单条超长字幕仍可能超过模型上下文限制。
 - WhisperX 只改善时间边界，不保证修复识别文本。
 - 双语轨按顺序配对，不执行语义对齐；段落数必须一致。
 - 竖屏视频没有独立版式；输出固定为 SDR `yuv420p`，不保留 HDR 元数据或色调映射。
-- 真实 YouTube、MLX、WhisperX、Codex、FFmpeg 和硬件编码路径不在 CI 中执行。
+- CI 执行合成视频的 FFmpeg/libass 软件渲染；真实 YouTube、MLX、WhisperX、Codex 和原生 VideoToolbox 仍需本机验收。
 
 ## 文档入口
 

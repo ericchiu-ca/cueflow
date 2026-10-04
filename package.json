@@ -1,0 +1,12 @@
+{
+  "name": "cueflow-browser-checks",
+  "private": true,
+  "scripts": {
+    "check:ui": "prettier --check subflow/static/app.js subflow/static/styles.css subflow/static/index.html && node --check subflow/static/app.js",
+    "test:browser": "node scripts/browser_smoke.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1",
+    "prettier": "3.9.9"
+  }
+}

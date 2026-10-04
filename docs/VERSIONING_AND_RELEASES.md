@@ -96,7 +96,7 @@ python3.11 -m subflow --help
 git diff --check
 ```
 
-还必须确认 GitHub Actions 的 Python 3.11 与 3.13 matrix 都成功。当前公开基线的两个 4:3 ASS 回归测试已在本地修复并通过，但本地结果不能替代目标 commit 的 GitHub Actions 结论。
+还必须确认 GitHub Actions 的 Python 3.11/3.12/3.13 matrix 与新增 render-browser job 都成功。当前公开基线的两个 4:3 ASS 回归测试已在本地修复并通过，但本地结果不能替代目标 commit 的 GitHub Actions 结论。
 
 ### 4. 干净安装与人工验收
 

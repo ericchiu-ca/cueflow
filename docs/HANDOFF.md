@@ -1,69 +1,66 @@
-# CueFlow 缓存修复与开发交接
+# CueFlow 开发交接
 
-记录日期：2026-10-03（America/Toronto）。本文件交接的是本地修复，不是发布或真实媒体全链路验收。
+记录日期：2026-10-03。本次为本地开发交接；没有推送、PR 创建/合并、发布、launcher 切换或用户模型配置写入。
 
 ## 从哪里继续
 
-- 当前开发仓库是 `cueflow-public`，远端为 `ericchiu-ca/cueflow`。
-- `cueflow` 目录是旧的私有归档，本次检查开始时有 11 个已修改 tracked 文件；不要覆盖、重置或把旧 `.git` 合入公开仓库。
-- 本次分支：`codex/cache-input-fingerprints`；基线：`895476a09b20f72340ad4659c1e29ac782c8bdbe`（`feat/resumable-jobs` / PR #4）。
-- 原开发 checkout 继续保持 `feat/resumable-jobs`，本次修改在独立本地 worktree。使用 `git worktree list --porcelain` 找到路径；临时 worktree 即使日后移除，已提交的本地分支仍在公开仓库 Git 中。
-- 下一位接手者先检查 `git status --short --branch`、`git log -3 --oneline` 和 worktree 列表。先阅读本文，再查看 `git diff 895476a..codex/cache-input-fingerprints`；不要从旧归档开始开发。
-
-## Claude 已有工作的状态
-
-以下是本次通过 GitHub CLI 只读查询的状态快照，合并前必须重新查询。四个 PR 均为 OPEN、MERGEABLE/CLEAN，各自 head 的 Python 3.11/3.12/3.13 检查全部 SUCCESS：
-
-| PR | head / 当前提交 | base | 内容 |
-| --- | --- | --- | --- |
-| [#1](https://github.com/ericchiu-ca/cueflow/pull/1) | `fix/review-findings` / `c755560` | `main` | 字幕、排版、转录、Web 与进程修复 |
-| [#2](https://github.com/ericchiu-ca/cueflow/pull/2) | `refactor/followups` / `09349a9` | `fix/review-findings` | 配对、字体打包、分批翻译、审校统一与重构 |
-| [#3](https://github.com/ericchiu-ca/cueflow/pull/3) | `fix/remaining-findings` / `27c5a2e` | `refactor/followups` | 剩余解析、ASR、ASS 和 UI 修复 |
-| [#4](https://github.com/ericchiu-ca/cueflow/pull/4) | `feat/resumable-jobs` / `895476a` | `fix/remaining-findings` | ASR/翻译续跑与统一任务生命周期 |
-
-原 CI 失败由上传中断测试的单次 `recv()` 引起，`09349a9` 改为读取完整响应并向后续分支合入；重新运行后的检查已成功。CI 卡点已经解除。上述绿色检查不覆盖本交接分支的新修改。
-
-依赖顺序为 #1 → #2 → #3 → #4，再集成本分支。合并策略（尤其 squash/rebase）会改变后续 PR 的 ancestry；每次合并后人工核对下一 PR 的 base、实际 diff 和当前 head 的 CI，不要只依赖自动重定向。此次没有推送、创建 PR、合并、修改仓库设置或发布。
-
-## 本次修复
-
-1. `subflow/translation.py`：翻译缓存匹配完整实际 prompt、输出 Schema、模型和 provider。时间、邻近上下文或翻译规则修改时，受影响批次重算；未受影响批次仍复用。
-2. `subflow/advanced_asr.py`：ASR 缓存匹配模型文件内容、worker 实现、语言、initial prompt 和音频内容。权重/配置原地替换、同名不同模型都不会复用旧结果；同内容迁移目录可以复用。
-3. `tests/test_translation.py`、`tests/test_advanced_asr.py`：添加行为回归，覆盖修复前失败、修复后通过及旧检查点失效；更新相邻上下文改变后的既有测试预期。
-4. `CHANGELOG.md`、`docs/ARCHITECTURE.md`、`docs/TESTING.md`：记录行为、验证及适用边界。
-
-旧检查点自动失效，不会手动删除用户项目文件；首次重跑可能需要重新处理。模型目录每批扫描一次，完整读取非隐藏文件，重试不重复扫描。运行期间保持权重不变。外部 Python/MLX 版本与云端模型的具体 revision 尚未冻结，`auto` 只记录选择本身；这些属于后续可复现性工作。
-
-## 验证证据
-
-- Python 3.11.15 / 3.12.15：各 111 项通过。
-- 修改涉及的四份 Python 文件：`ruff check` 通过；`git diff --check` 通过。
-- wheel：构建成功；在独立环境、仓库外确认 Schema、静态页、字体与 CLI 可用。安装 smoke 使用 `--no-deps --no-index`，不证明运行时依赖解析成功。
-- 真实 Turbo MLX worker：macOS 合成短语音 → 两段结果 → 用不可用 Python 从检查点复用成功；约 7.49 s / 0.63 s。完整边界及输入 hash 见 [TESTING.md](TESTING.md)。合成语音 smoke 不是字幕质量验收。
-- 未执行：本分支 Python 3.13、本分支 GitHub CI、真实 VAD/full large-v3/WhisperX 全链路、真实 Codex 分批与失败恢复、浏览器和成片人工验收。
-
-复核命令（在本分支 worktree 内）：
+- 当前公开开发仓库是 `cueflow-public`，remote 为 `ericchiu-ca/cueflow`。`cueflow` 是保留的旧私有归档，检查开始时有 11 个已修改 tracked 文件；不要覆盖、重置或复用旧 `.git`。
+- 本次分支：`codex/local-workflow-reliability`；父提交为 `b2021638214cae5918ca584495d918221b612535`（`codex/cache-input-fingerprints`），再往前是 `895476a09b20f72340ad4659c1e29ac782c8bdbe`（`feat/resumable-jobs` / PR #4）。
+- 修改位于独立本地 worktree。用 `git worktree list --porcelain` 查询路径；临时 worktree 不作为唯一恢复来源，本地分支与交接 patch 都保留。
+- 原公开 checkout 继续保持 `feat/resumable-jobs`。下一位接手先看 `git status --short --branch`、`git log -3 --oneline`，确认没有进入旧归档或 main。
 
 ```bash
-python3.11 -m unittest discover -s tests -v
-python3.12 -m unittest discover -s tests -v
-ruff check subflow/translation.py subflow/advanced_asr.py tests/test_translation.py tests/test_advanced_asr.py
-python3.11 -m pip wheel . --no-deps --no-build-isolation -w dist
-git diff --check
+git diff b202163..codex/local-workflow-reliability  # 本轮六项修改
+git diff 895476a..codex/local-workflow-reliability # 包含前轮缓存修复
 ```
 
-## 接下来的步骤
+## 本轮完成内容
 
-1. 审查本分支差异，核对当前四个 PR 状态；推送前确认用户授权。若作为新的叠加 PR，其 base 应为 `feat/resumable-jobs`，前提是该分支尚未合并；否则依据真实 main 重新选择基线并运行检查。
-2. 为本机配置正确模型/helper 路径。公开版本默认 `~/Documents/FrameLedger`，检查时本机资源在 `~/Documents/ChatGPT/FrameLedger`。本次只在测试中指定路径，未更改用户持久环境或应用 launcher：
+| 范围 | 行为与入口 |
+| --- | --- |
+| 重试 | `JobManager.resume_job` 在锁内预占尝试；重复或并发请求只执行一次，过期尝试不能覆盖新尝试。原翻译 retry API 保持兼容。 |
+| 配置 | `settings.py` 共用 CLI/Web 路径解析；参数 > 环境 > 保存设置 > 自动发现，FrameLedger 新旧目录均支持。网页配置可保存/检查，活动任务期间拒绝修改；未知字段/无效路径不落盘。 |
+| 持久化/取消 | `job_store.py` 原子写入项目内 `job.state.json`，相对 output root、版本化、恢复时校验路径。重启未完成任务等待人工恢复；取消保留输入/检查点，只终止关联进程。直接父进程退出后仍清理孙进程。 |
+| 真实 smoke / CI | `scripts/render_smoke.py` 实际 FFmpeg/libass 烧录合成视频；`scripts/browser_smoke.mjs` 使用真实 HTTP/前端与合成 provider，验证设置、恢复/取消、刷新历史、审校、未保存保护。新增 Ubuntu job；原 Python 3.11/3.12/3.13 matrix 保留。 |
+| 前端拆分 | `static/index.html`、`app.js`、`styles.css` 分离并格式化；静态路由白名单，wheel 全部打包；新增环境配置与任务记录面板。 |
+| 格式/文档 | master/manifest/config/job/provenance 带 v1；legacy master 可读，未知版本拒绝。provenance 含输入/输出 SHA-256、模型/worker 指纹、时间与可取得工具版本，缺失为 null。README、架构、测试、安全与发布文档同步。 |
 
-   ```bash
-   export SUBFLOW_MLX_MODEL="$HOME/Documents/ChatGPT/FrameLedger/.cache/models/whisper-large-v3-turbo"
-   export SUBFLOW_MLX_LARGE_MODEL="$HOME/Documents/ChatGPT/FrameLedger/.cache/models/whisper-large-v3-mlx"
-   export SUBFLOW_MLX_HELPER="$HOME/Documents/ChatGPT/FrameLedger/phase2/mlx_whisper_asr/run"
-   export SUBFLOW_WHISPERX_PYTHON="$HOME/Documents/ChatGPT/cueflow-public/.venv-whisperx/bin/python"
-   ```
+前轮 `b202163` 同时保留：翻译缓存匹配完整实际 prompt、Schema、模型和 provider；ASR 缓存匹配音频、语言、initial prompt、模型文件内容和 worker，实现同名/原地模型更新失效、内容迁移仍复用。旧键自动失效，可能首次重算。不要删除用户检查点来模拟修复。
 
-3. 使用获授权的短视频做真实 VAD → Turbo/large-v3 → WhisperX → 审校 → ASS → 压制验收，保存工具版本、输入/输出 hash、命令和人工结论。真实 Codex 翻译会发送字幕数据；完成必要的数据授权后再验证分批与恢复。
-4. 合并前重查当前 head 的 CI，按依赖顺序处理 PR。发布版本、tag、Release、仓库设置和部署仍需要单独授权。
-5. 不清理原有用户媒体或检查点；临时验证产物留在忽略目录。交接包保留 patch、验证摘要和 CI 状态快照，临时 worktree 不作为唯一恢复来源。
+## 验证与证据边界
+
+- Python 3.11.15 / 3.12.15：各 **128/128**。新增 17 项生命周期、配置与格式回归；前轮 4 项缓存回归仍通过。
+- `ruff check subflow tests scripts`、`npm run check:ui`、`git diff --check`：通过。
+- wheel：重新构建后，在独立 venv、仓库外验证 CLI、Schema、HTML/JS/CSS、字体和新模块；安装 smoke 为 `--no-index --no-deps`，不代表完整依赖解析成功。
+- Chromium / Playwright 1.62.1：桌面 1440×1000、手机 390×844，无 console/HTTP 错误或横向溢出；配置、恢复/取消、下载、刷新、审校保存、未保存保护、ASS 生成/预览通过。Browser 插件不可用，使用 Playwright。
+- FFmpeg 9.0.2：真实合成 960×540 和 720×540 视频，字幕像素/安全边界与特殊字符路径通过；两段生产 `hevc_videotoolbox` 烧录通过，生成 provenance。
+- macOS 沙箱最初拒绝 Chromium Mach port 与 VideoToolbox；宿主权限重跑通过。这些是合成 smoke，不代表真实字幕语义/成片质量验收。
+- 前轮真实 Turbo MLX 合成语音检查点复用通过，完整记录在 [TESTING.md](TESTING.md)。本轮没有调用 MLX/full large-v3/WhisperX 模型、Codex 翻译或 YouTube。
+- **未验证**：本地 Python 3.13、当前新提交的 GitHub CI、Ubuntu render-browser 实跑、真实模型/翻译质量与长视频端到端。CI 定义完成不等于已在 GitHub 成功。
+
+复核命令见 [TESTING.md](TESTING.md)。Node.js 22 和 `package-lock.json` 只服务开发/CI；正常使用不需要 Node。
+
+## 持久状态注意事项
+
+- 默认 config 在用户 Application Support 目录，`CUEFLOW_CONFIG` 或 `--config` 可覆盖。此次测试只用了临时配置，没有改变用户正式配置或 FrameLedger。
+- 原生模型目录/工具路径不包含在 Git；截图与任务错误可能显示本机路径，交接证据属于本地私有材料。
+- 重启时不会自动执行任何已恢复任务，也不会自动补写旧项目记录。旧版没有 `job.state.json` 的项目需要重新导入/CLI 重跑；输入丢失或上传不完整应重新上传。
+- 取消是协作式停止；媒体处理和探测进程被跟踪，少数短小版本/环境检查仍受原有超时限制。保留已完成检查点，半写输出不能当完成结果。
+- 审校 session 与未保存编辑仍不能跨服务重启恢复；先保存/下载。已保存 reviewed SRT 仍可人工导入。
+- 未知 remote 模型 revision 保留 null；provenance 不冻结外部 ML 依赖，也不证明文本正确。模型运行期间需保持文件不变。
+- 清理仍是永久删除六类受管项目（包含任务记录）；本轮没有执行用户目录清理。
+
+## Claude PR 状态快照与集成顺序
+
+以下是此前 2026-10-03 通过 GitHub CLI 只读取得的快照，**合并前必须刷新**；本轮没有重新查询远端。四个 PR 当时都是 OPEN、MERGEABLE/CLEAN，各自 head 的 Python 3.11/3.12/3.13 CI 为 SUCCESS：
+
+| PR | head / 提交 | base |
+| --- | --- | --- |
+| [#1](https://github.com/ericchiu-ca/cueflow/pull/1) | `fix/review-findings` / `c755560` | `main` |
+| [#2](https://github.com/ericchiu-ca/cueflow/pull/2) | `refactor/followups` / `09349a9` | `fix/review-findings` |
+| [#3](https://github.com/ericchiu-ca/cueflow/pull/3) | `fix/remaining-findings` / `27c5a2e` | `refactor/followups` |
+| [#4](https://github.com/ericchiu-ca/cueflow/pull/4) | `feat/resumable-jobs` / `895476a` | `fix/remaining-findings` |
+
+旧 CI 卡点是中断上传测试依赖单次 `recv()`，`09349a9` 已改为完整读取响应并向下合入。这些绿色检查只覆盖旧 heads。
+
+建议集成顺序 #1 → #2 → #3 → #4 → `b202163` 缓存修复 → 本轮分支。若直接为两轮本地提交建叠加 PR，未合并时 base 可用 `feat/resumable-jobs`；若祖先已经 squash/rebase 合入，依据真实 main 重新整理 diff。每次合并后复查下一 PR 的 base、head、实际 diff 与当前 CI，防止重复提交。推送、合并、tag、Release、launcher 切换或部署仍需用户授权。

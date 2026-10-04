@@ -62,7 +62,9 @@ def normalize_segments(segments: Iterable[SubtitleSegment]) -> List[SubtitleSegm
 PAIRING_TIME_TOLERANCE = 0.25
 
 
-def _cues_overlap(first: SubtitleSegment, second: SubtitleSegment, tolerance: float) -> bool:
+def _cues_overlap(
+    first: SubtitleSegment, second: SubtitleSegment, tolerance: float
+) -> bool:
     return first.start < second.end + tolerance and second.start < first.end + tolerance
 
 
@@ -87,14 +89,21 @@ def track_pairing(
     on_source_timeline = 0
     for cue in chinese:
         index = bisect_left(starts, cue.end + tolerance)
-        if any(_cues_overlap(candidate, cue, tolerance) for candidate in ordered[max(0, index - 3) : index]):
+        if any(
+            _cues_overlap(candidate, cue, tolerance)
+            for candidate in ordered[max(0, index - 3) : index]
+        ):
             on_source_timeline += 1
     shared = bool(chinese) and on_source_timeline * 2 >= len(chinese)
-    first_divergence = next(
-        (source[index] for index, ok in enumerate(overlaps) if not ok), None
-    ) if shared else None
+    first_divergence = (
+        next((source[index] for index, ok in enumerate(overlaps) if not ok), None)
+        if shared
+        else None
+    )
     if shared and len(source) != len(chinese) and first_divergence is None:
-        first_divergence = source[len(overlaps)] if len(source) > len(overlaps) else None
+        first_divergence = (
+            source[len(overlaps)] if len(source) > len(overlaps) else None
+        )
     drifted_ids = (
         [source[index].id for index, ok in enumerate(overlaps) if not ok]
         if shared and len(source) == len(chinese)
@@ -140,9 +149,13 @@ def parse_srt_text(raw: str) -> List[SubtitleSegment]:
             continue
         # Cue settings may follow the end time (e.g. "X1:10 X2:20" or VTT-style
         # "position:50%"); only the two timestamps matter here.
-        match = SRT_TIME_LINE_RE.match(time_line) if time_line.count("-->") == 1 else None
+        match = (
+            SRT_TIME_LINE_RE.match(time_line) if time_line.count("-->") == 1 else None
+        )
         if not match:
-            raise ValueError(f"Invalid SRT time line in block {block_number}: {time_line!r}")
+            raise ValueError(
+                f"Invalid SRT time line in block {block_number}: {time_line!r}"
+            )
         try:
             start = round(_to_seconds(match.group(1)), 3)
             end = round(_to_seconds(match.group(2)), 3)
@@ -164,7 +177,9 @@ def parse_srt_file(path: Path) -> List[SubtitleSegment]:
     return parse_srt_text(path.read_text(encoding="utf-8-sig"))
 
 
-def build_srt_text(segments: List[SubtitleSegment], translations: Dict[str, str] | None = None) -> str:
+def build_srt_text(
+    segments: List[SubtitleSegment], translations: Dict[str, str] | None = None
+) -> str:
     lines: List[str] = []
     for i, segment in enumerate(segments, start=1):
         lines.append(str(i))
@@ -177,7 +192,9 @@ def build_srt_text(segments: List[SubtitleSegment], translations: Dict[str, str]
     return "\n".join(lines)
 
 
-def build_bilingual_srt_text(segments: List[SubtitleSegment], translations: Dict[str, str]) -> str:
+def build_bilingual_srt_text(
+    segments: List[SubtitleSegment], translations: Dict[str, str]
+) -> str:
     lines: List[str] = []
     for i, segment in enumerate(segments, start=1):
         zh = (translations.get(segment.id, "") or "").strip()
@@ -207,15 +224,20 @@ def save_master_json(
     metadata: dict | None = None,
 ) -> None:
     payload = {
+        "schema_version": 1,
         "segments": [asdict(segment) for segment in segments],
     }
     if metadata:
         payload["metadata"] = metadata
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    from .settings import atomic_json
+
+    atomic_json(path, payload)
 
 
 def load_master_json(path: Path) -> List[SubtitleSegment]:
     raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or raw.get("schema_version", 1) != 1:
+        raise ValueError("Unsupported master.json schema version.")
     segments_raw = raw.get("segments", [])
     return [
         SubtitleSegment(

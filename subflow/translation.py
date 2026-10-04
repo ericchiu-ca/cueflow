@@ -16,6 +16,7 @@ from typing import Any, Callable, Sequence
 
 from .core import build_srt_text
 from .proc import run_captured
+from .provenance import command_version, write_provenance
 
 
 CODEX_MODEL_CHOICES = (
@@ -87,7 +88,9 @@ class TranslationProvider(ABC):
 
 
 def _resolve_codex_path(configured_path: str | None = None) -> str:
-    candidate = configured_path or os.environ.get("SUBFLOW_CODEX") or shutil.which("codex")
+    candidate = (
+        configured_path or os.environ.get("SUBFLOW_CODEX") or shutil.which("codex")
+    )
     if not candidate:
         raise TranslationSetupError(
             "Codex CLI is not installed or not on PATH. Install Codex, then run "
@@ -150,6 +153,7 @@ def build_translation_prompt(request: TranslationRequest) -> str:
     source_name = SOURCE_LANGUAGE_NAMES.get(
         request.source_language, request.source_language
     )
+
     def serialize(segments: Sequence[Any]) -> str:
         return json.dumps(
             [
@@ -307,7 +311,11 @@ class CodexCLITranslationProvider(TranslationProvider):
         # 0001..N, so a stale file with the same cue count would pass validation.
         output_path.unlink(missing_ok=True)
         if progress:
-            progress("translation", 30, "Codex is translating subtitle text with structured output...")
+            progress(
+                "translation",
+                30,
+                "Codex is translating subtitle text with structured output...",
+            )
         try:
             with tempfile.TemporaryDirectory(prefix="cueflow-codex-") as temp_dir:
                 result = run_captured(
@@ -331,7 +339,11 @@ class CodexCLITranslationProvider(TranslationProvider):
                 "Codex completed without writing its structured translation result."
             )
         if progress:
-            progress("translation", 82, "Validating IDs and building Chinese subtitle artifacts...")
+            progress(
+                "translation",
+                82,
+                "Validating IDs and building Chinese subtitle artifacts...",
+            )
         try:
             payload = json.loads(output_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
@@ -366,9 +378,7 @@ def get_translation_provider(name: str) -> TranslationProvider:
     raise TranslationError(f"Unknown translation provider: {name}")
 
 
-def _batch_fingerprint(
-    request: TranslationRequest, *, provider: str
-) -> str:
+def _batch_fingerprint(request: TranslationRequest, *, provider: str) -> str:
     """Match the actual prompt and output contract, including neighbouring cues."""
     material = json.dumps(
         {
@@ -376,7 +386,9 @@ def _batch_fingerprint(
             "model": request.model,
             "provider": provider,
             "prompt": build_translation_prompt(request),
-            "schema_sha256": hashlib.sha256(TRANSLATION_SCHEMA.read_bytes()).hexdigest(),
+            "schema_sha256": hashlib.sha256(
+                TRANSLATION_SCHEMA.read_bytes()
+            ).hexdigest(),
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -384,7 +396,9 @@ def _batch_fingerprint(
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
-def _load_checkpoint(path: Path, fingerprint: str, batch: Sequence[Any]) -> dict[str, str] | None:
+def _load_checkpoint(
+    path: Path, fingerprint: str, batch: Sequence[Any]
+) -> dict[str, str] | None:
     """A previously validated batch, only if it was made from identical input."""
     try:
         saved = json.loads(path.read_text(encoding="utf-8"))
@@ -421,9 +435,13 @@ def _translate_in_batches(
             tuple(batch),
             source_language,
             model,
-            context_before=tuple(segments[max(0, start - TRANSLATION_CONTEXT_CUES) : start]),
+            context_before=tuple(
+                segments[max(0, start - TRANSLATION_CONTEXT_CUES) : start]
+            ),
             context_after=tuple(
-                segments[start + len(batch) : start + len(batch) + TRANSLATION_CONTEXT_CUES]
+                segments[
+                    start + len(batch) : start + len(batch) + TRANSLATION_CONTEXT_CUES
+                ]
             ),
         )
         checkpoint = batch_dir / f"{number:03d}.checkpoint.json"
@@ -443,10 +461,16 @@ def _translate_in_batches(
             continue
         label = f"Batch {number}/{total} ({batch[0].id}-{batch[-1].id})"
 
-        def batch_progress(stage: str, percent: int, message: str, *, _number: int = number) -> None:
+        def batch_progress(
+            stage: str, percent: int, message: str, *, _number: int = number
+        ) -> None:
             if progress:
-                overall = 10 + int(80 * ((_number - 1) + min(max(percent, 0), 100) / 100) / total)
-                progress(stage, overall, f"{label}: {message}" if total > 1 else message)
+                overall = 10 + int(
+                    80 * ((_number - 1) + min(max(percent, 0), 100) / 100) / total
+                )
+                progress(
+                    stage, overall, f"{label}: {message}" if total > 1 else message
+                )
 
         last_error: TranslationError | None = None
         for attempt in range(1, TRANSLATION_BATCH_ATTEMPTS + 1):
@@ -462,7 +486,8 @@ def _translate_in_batches(
                         {
                             "fingerprint": fingerprint,
                             "segments": [
-                                {"id": str(s.id), "text": batch_translations[str(s.id)]} for s in batch
+                                {"id": str(s.id), "text": batch_translations[str(s.id)]}
+                                for s in batch
                             ],
                         },
                         ensure_ascii=False,
@@ -506,7 +531,10 @@ def run_translation_project(
         raise TranslationError("The source SRT contains no subtitle segments.")
     provider = provider_instance or get_translation_provider(provider_name)
     # Model names are provider-specific; only Codex has a fixed list today.
-    if isinstance(provider, CodexCLITranslationProvider) and model not in CODEX_MODEL_CHOICES:
+    if (
+        isinstance(provider, CodexCLITranslationProvider)
+        and model not in CODEX_MODEL_CHOICES
+    ):
         raise TranslationError(f"Unsupported Codex model: {model}")
 
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -524,6 +552,7 @@ def run_translation_project(
         build_translation_input_text(segments), encoding="utf-8"
     )
     master_payload = {
+        "schema_version": 1,
         "metadata": {
             "source": Path(source_filename).name,
             "source_language": source_language,
@@ -558,7 +587,11 @@ def run_translation_project(
     )
     result_json_path.write_text(
         json.dumps(
-            {"segments": [{"id": str(s.id), "text": translations[str(s.id)]} for s in segments]},
+            {
+                "segments": [
+                    {"id": str(s.id), "text": translations[str(s.id)]} for s in segments
+                ]
+            },
             ensure_ascii=False,
             indent=2,
         )
@@ -573,8 +606,30 @@ def run_translation_project(
     ]
     zh_srt_path.write_text(build_srt_text(translated_segments), encoding="utf-8")
     warnings = translation_warnings(segments, translations)
+    codex = None
+    if isinstance(provider, CodexCLITranslationProvider):
+        try:
+            codex = _resolve_codex_path(provider.codex_path)
+        except TranslationError:
+            pass
+    write_provenance(
+        project_dir / "provenance.json",
+        operation="translation",
+        inputs={"source_srt": source_srt_path},
+        outputs={"chinese_srt": zh_srt_path, "result": result_json_path},
+        tools={"codex": command_version(codex, "--version")},
+        options={
+            "source_language": source_language,
+            "provider": provider.name,
+            "model_selection": model,
+            "resolved_model_revision": None,
+            "batch_size": batch_size,
+        },
+    )
     if progress:
-        progress("writing", 96, "Chinese SRT and stable-ID translation files are ready.")
+        progress(
+            "writing", 96, "Chinese SRT and stable-ID translation files are ready."
+        )
     return TranslationArtifacts(
         master_path=master_path,
         source_srt_path=source_srt_path,

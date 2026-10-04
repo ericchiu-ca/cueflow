@@ -37,7 +37,9 @@ def _write_outputs(project: Path, segments: list[SubtitleSegment]) -> None:
     project.mkdir(parents=True, exist_ok=True)
     save_master_json(project / "master.json", segments)
     (project / "en.srt").write_text(build_srt_text(segments), encoding="utf-8")
-    (project / "translation_input.txt").write_text(build_translation_input_text(segments), encoding="utf-8")
+    (project / "translation_input.txt").write_text(
+        build_translation_input_text(segments), encoding="utf-8"
+    )
 
 
 def _build_from_translation(project: Path, translation_file: Path) -> None:
@@ -49,8 +51,12 @@ def _build_from_translation(project: Path, translation_file: Path) -> None:
     segments = load_master_json(project_master)
     output_dir = project / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "zh.srt").write_text(build_srt_text(segments, translations), encoding="utf-8")
-    (output_dir / "bilingual.srt").write_text(build_bilingual_srt_text(segments, translations), encoding="utf-8")
+    (output_dir / "zh.srt").write_text(
+        build_srt_text(segments, translations), encoding="utf-8"
+    )
+    (output_dir / "bilingual.srt").write_text(
+        build_bilingual_srt_text(segments, translations), encoding="utf-8"
+    )
 
 
 def cmd_prepare(args: argparse.Namespace) -> int:
@@ -73,7 +79,9 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     else:
         audio_path = project / "source.m4a"
         download_audio_m4a(args.url, audio_path)
-        segments = transcribe_with_faster_whisper(audio_path, model_name=args.whisper_model)
+        segments = transcribe_with_faster_whisper(
+            audio_path, model_name=args.whisper_model
+        )
 
     segments = normalize_segments(segments)
     if not segments:
@@ -101,7 +109,9 @@ def cmd_import_translation(args: argparse.Namespace) -> int:
     # Keep a canonical translation filename for later `build`/`qc` commands.
     canonical = project / "translation_zh.txt"
     if translation_path.name != canonical.name:
-        canonical.write_text(translation_path.read_text(encoding="utf-8"), encoding="utf-8")
+        canonical.write_text(
+            translation_path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
 
     print(f"Generated output subtitles in {project / 'output'}")
     return 0
@@ -133,7 +143,9 @@ def cmd_qc(args: argparse.Namespace) -> int:
 
     segments = load_master_json(master_path)
     translation_path = project / "translation_zh.txt"
-    translations = parse_translation_file(translation_path) if translation_path.exists() else None
+    translations = (
+        parse_translation_file(translation_path) if translation_path.exists() else None
+    )
 
     issues = run_qc(
         segments=segments,
@@ -225,6 +237,7 @@ def cmd_web(args: argparse.Namespace) -> int:
         whisperx_python=args.whisperx_python,
         open_browser=not args.no_open,
         max_upload_gb=args.max_upload_gb,
+        config_path=args.config,
     )
     return 0
 
@@ -244,7 +257,11 @@ def cmd_build_ass(args: argparse.Namespace) -> int:
 
 def cmd_burn(args: argparse.Namespace) -> int:
     video = Path(args.video).expanduser()
-    output = Path(args.output).expanduser() if args.output else video.with_name(f"{video.stem}.bilingual.mp4")
+    output = (
+        Path(args.output).expanduser()
+        if args.output
+        else video.with_name(f"{video.stem}.bilingual.mp4")
+    )
     result = burn_ass_into_video(
         video,
         args.ass,
@@ -285,25 +302,48 @@ def build_parser() -> argparse.ArgumentParser:
         description="Local transcription, translation, review, ASS, and video workflow",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument(
+        "--config",
+        dest="settings_file",
+        help="Private resource configuration shared with the Web UI",
+    )
 
-    prepare = sub.add_parser("prepare", help="Download subtitles / transcribe and generate master + en.srt")
+    prepare = sub.add_parser(
+        "prepare", help="Download subtitles / transcribe and generate master + en.srt"
+    )
     prepare.add_argument("url", help="YouTube URL")
     prepare.add_argument("--output", required=True, help="Output project directory")
-    prepare.add_argument("--whisper-model", default="base", help="faster-whisper model size")
+    prepare.add_argument(
+        "--whisper-model", default="base", help="faster-whisper model size"
+    )
     prepare.set_defaults(func=cmd_prepare)
 
-    imp = sub.add_parser("import-translation", help="Import translated text by ID and generate translated SRTs")
-    imp.add_argument("translation_file", help="translation_zh.txt like file with [0001] blocks")
+    imp = sub.add_parser(
+        "import-translation",
+        help="Import translated text by ID and generate translated SRTs",
+    )
+    imp.add_argument(
+        "translation_file", help="translation_zh.txt like file with [0001] blocks"
+    )
     imp.set_defaults(func=cmd_import_translation)
 
-    build = sub.add_parser("build", help="Build zh.srt and bilingual.srt from translation_zh.txt")
+    build = sub.add_parser(
+        "build", help="Build zh.srt and bilingual.srt from translation_zh.txt"
+    )
     build.add_argument("project", help="Project directory")
     build.set_defaults(func=cmd_build)
 
     qc = sub.add_parser("qc", help="Run subtitle quality checks")
     qc.add_argument("project", help="Project directory")
-    qc.add_argument("--min-duration", type=float, default=1.0, help="Min segment duration seconds")
-    qc.add_argument("--max-chinese-chars", type=int, default=45, help="Max Chinese subtitle characters")
+    qc.add_argument(
+        "--min-duration", type=float, default=1.0, help="Min segment duration seconds"
+    )
+    qc.add_argument(
+        "--max-chinese-chars",
+        type=int,
+        default=45,
+        help="Max Chinese subtitle characters",
+    )
     qc.set_defaults(func=cmd_qc)
 
     transcribe = sub.add_parser(
@@ -346,7 +386,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Translate an English or Canadian French SRT to Chinese with Codex",
     )
     translate.add_argument("source_srt", help="English or Canadian French SRT")
-    translate.add_argument("--output", required=True, help="Translation project directory")
+    translate.add_argument(
+        "--output", required=True, help="Translation project directory"
+    )
     translate.add_argument(
         "--language",
         choices=("en", "fr-CA"),
@@ -371,13 +413,22 @@ def build_parser() -> argparse.ArgumentParser:
     web.add_argument("--host", default="127.0.0.1", help="Loopback bind address only")
     web.add_argument("--port", type=int, default=8765, help="Local port")
     web.add_argument("--output", default="projects/local", help="Project output root")
-    web.add_argument("--max-upload-gb", type=float, default=20.0, help="Upload size limit")
-    web.add_argument("--no-open", action="store_true", help="Do not open the browser automatically")
+    web.add_argument(
+        "--max-upload-gb", type=float, default=20.0, help="Upload size limit"
+    )
+    web.add_argument(
+        "--no-open", action="store_true", help="Do not open the browser automatically"
+    )
+    web.add_argument("--config", help="Private local resource configuration file")
     _add_local_model_options(web)
     web.set_defaults(func=cmd_web)
 
-    ass = sub.add_parser("build-ass", help="Pair source-language and Chinese SRT files into a styled ASS")
-    ass.add_argument("source_srt", help="English or French source SRT; its timeline is authoritative")
+    ass = sub.add_parser(
+        "build-ass", help="Pair source-language and Chinese SRT files into a styled ASS"
+    )
+    ass.add_argument(
+        "source_srt", help="English or French source SRT; its timeline is authoritative"
+    )
     ass.add_argument("chinese_srt", help="Chinese SRT with the same number of segments")
     ass.add_argument("--output", required=True, help="Output .ass path")
     ass.add_argument("--title", help="Optional ASS title")
@@ -386,7 +437,9 @@ def build_parser() -> argparse.ArgumentParser:
     burn = sub.add_parser("burn", help="Hard-burn an ASS subtitle into a new MP4")
     burn.add_argument("video", help="Input video path")
     burn.add_argument("ass", help="Input ASS subtitle path")
-    burn.add_argument("--output", help="Output MP4 path (defaults beside the source video)")
+    burn.add_argument(
+        "--output", help="Output MP4 path (defaults beside the source video)"
+    )
     burn.add_argument(
         "--profile",
         choices=("hevc-source", "hevc"),
@@ -408,7 +461,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        return args.func(args)
+        from .settings import Settings, resource_context
+
+        config_path = args.settings_file or getattr(args, "config", None)
+        if args.command == "web":
+            args.config = config_path
+            return args.func(
+                args
+            )  # Web reports malformed configuration and allows local repair.
+        with resource_context(Settings(config_path).load()):
+            return args.func(args)
     except (RuntimeError, ValueError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 2

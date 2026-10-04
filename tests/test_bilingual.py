@@ -102,7 +102,7 @@ Public transit shaped the city.
         with tempfile.TemporaryDirectory() as temp_value, (
             patch("subflow.bilingual._ensure_fonts")
         ), patch("subflow.bilingual.find_ass_ffmpeg", return_value=Path("ffmpeg")), patch(
-            "subflow.bilingual.subprocess.run", side_effect=subprocess.TimeoutExpired(["ffmpeg"], 60)
+            "subflow.bilingual.run_captured", side_effect=subprocess.TimeoutExpired(["ffmpeg"], 60)
         ):
             fonts = Path(temp_value) / "fonts"
             fonts.mkdir()
@@ -250,7 +250,7 @@ class TestVideoProbe(unittest.TestCase):
 
         with (
             patch("subflow.bilingual._ffprobe_path", return_value=Path("ffprobe")),
-            patch("subflow.bilingual.subprocess.run", side_effect=fake_ffprobe) as run,
+            patch("subflow.bilingual.run_captured", side_effect=fake_ffprobe) as run,
         ):
             duration, geometry = _probe_video_info(Path("ffmpeg"), Path("audio-first.mkv"))
 
@@ -279,7 +279,7 @@ class TestVideoProbe(unittest.TestCase):
             with (
                 self.subTest(stream=stream),
                 patch("subflow.bilingual._ffprobe_path", return_value=Path("ffprobe")),
-                patch("subflow.bilingual.subprocess.run", side_effect=probe_payload(stream)),
+                patch("subflow.bilingual.run_captured", side_effect=probe_payload(stream)),
             ):
                 _duration, geometry = _probe_video_info(Path("ffmpeg"), Path("clip.mov"))
                 self.assertEqual((geometry.width, geometry.height), expected)

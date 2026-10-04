@@ -15,7 +15,8 @@ CueFlow 是本地桌面工作流。Web 服务只支持 `127.0.0.1`、`::1` 或 `
 - 新生成的转录 `master.json` 只保存模型目录 basename，并递归把嵌套元数据字符串中的绝对本机路径替换为 `<local-path>`；旧项目经 WhisperX 重新对齐时也会清理遗留模型路径。
 - ASS 项目的 `manifest.json` 只保存项目内相对输出路径，并清理预览错误中的绝对本机路径。
 - `master.json` 仍包含源媒体 basename、字幕、时间、语言、质量问题和置信度信息。这些内容可能属于个人、客户或受限制数据，分享前仍必须检查。
-- Web job、review session 与 CSRF token 只存在于当前进程；项目文件写入用户指定的本地 output root。
+- Web job 写入受管项目内的 `job.state.json`，路径相对 output root；恢复时校验类别、版本和路径，重启后不会自动执行。review session 与 CSRF token 仍只存在于当前进程。
+- 本机配置保存绝对资源路径；配置、任务状态和 provenance 新文件权限为 `0600`。任务错误、文件名和产物内容可能敏感，分享项目或截图前应检查。provenance 只记录 basename 与摘要，不记录凭据或绝对路径。配置修改和任务恢复/取消同样要求 CSRF。
 
 ## 本地 Web 控制
 

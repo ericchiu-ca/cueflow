@@ -73,7 +73,7 @@ class WebSecurityTests(unittest.TestCase):
                 ):
                     environment = manager.environment()
 
-                self.assertEqual(environment["model"]["path"], str(model))
+                self.assertEqual(Path(environment["model"]["path"]).resolve(), model.resolve())
                 self.assertTrue(environment["model"]["ready"])
             finally:
                 manager.executor.shutdown(wait=True, cancel_futures=True)
@@ -300,7 +300,7 @@ class WebRobustnessTests(unittest.TestCase):
         writes = {r[0]: r[2] for r in CueFlowHandler.POST_ROUTES}
         self.assertFalse(writes["_post_cleanup"])
         self.assertFalse(writes["_post_review_audit"])
-        self.assertTrue(all(v for k, v in writes.items() if k not in {"_post_cleanup", "_post_review_audit"}))
+        self.assertTrue(all(v for k, v in writes.items() if k not in {"_post_cleanup", "_post_review_audit", "_post_config", "_post_cancel"}))
 
     def test_unexpected_get_error_returns_json_500(self):
         with tempfile.TemporaryDirectory() as temp_value:

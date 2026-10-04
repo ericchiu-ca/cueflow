@@ -41,5 +41,4 @@ where = ["."]
 include = ["subflow*"]
 
 [tool.setuptools.package-data]
-subflow = ["static/*.html", "schemas/*.json", "fonts/*"]
-
+subflow = ["static/*.html", "static/*.js", "static/*.css", "schemas/*.json", "fonts/*"]

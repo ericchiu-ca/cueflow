@@ -588,10 +588,10 @@ class TestAdvancedAsr(unittest.TestCase):
 
     def test_frontend_recognizes_mixed_whisperx_alignment(self):
         html = (
-            Path(__file__).resolve().parents[1] / "subflow" / "static" / "index.html"
+            Path(__file__).resolve().parents[1] / "subflow" / "static" / "app.js"
         ).read_text(encoding="utf-8")
-        self.assertIn("(job.alignment||'').startsWith('whisperx')", html)
-        self.assertNotIn("job.alignment==='whisperx'", html)
+        self.assertRegex(html, r"startsWith\([\"']whisperx[\"']\)")
+        self.assertNotRegex(html, r"alignment\s*===\s*[\"']whisperx[\"']")
 
 
 if __name__ == "__main__":

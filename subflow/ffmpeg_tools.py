@@ -16,13 +16,14 @@ import subprocess
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable
+from .settings import resolve_resource
 
 FFMPEG_FULL_PATH = Path("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg")
 
 
 def ffmpeg_candidates(configured: str | Path | None = None) -> list[Path]:
     candidates: list[Path] = []
-    configured_value = configured or os.environ.get("SUBFLOW_FFMPEG")
+    configured_value = resolve_resource("ffmpeg_path", configured)
     if configured_value:
         candidates.append(Path(configured_value).expanduser())
     candidates.append(FFMPEG_FULL_PATH)
